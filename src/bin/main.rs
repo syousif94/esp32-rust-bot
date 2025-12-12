@@ -109,7 +109,23 @@ async fn main(spawner: Spawner) -> ! {
     // Spawn background tasks
     spawner.spawn(connection(controller)).ok();
     spawner.spawn(net_task(runner)).ok();
+    spawner.spawn(wifi_ready_task(spawner, stack)).ok();
 
+    // Main loop - handle servo angle updates from HTTP or serial
+    // This runs immediately, allowing serial control before WiFi connects
+    loop {
+        // Wait for angle signal from either HTTP or serial
+        let angle = match select(SERVO_ANGLE.wait(), SERIAL_SERVO_ANGLE.wait()).await {
+            Either::First(angle) => angle,
+            Either::Second(angle) => angle,
+        };
+        servo.set_angle(angle);
+        println!("Servo moved to {} degrees", angle);
+    }
+}
+
+#[embassy_executor::task]
+async fn wifi_ready_task(spawner: Spawner, stack: embassy_net::Stack<'static>) {
     // Wait for link to be up
     loop {
         if stack.is_link_up() {
@@ -129,19 +145,8 @@ async fn main(spawner: Spawner) -> ! {
 
     println!("WiFi connected successfully!");
 
-    // Spawn HTTP server
+    // Spawn HTTP server once WiFi is ready
     spawner.spawn(http_server_task(stack)).ok();
-
-    // Main loop - handle servo angle updates from HTTP or serial
-    loop {
-        // Wait for angle signal from either HTTP or serial
-        let angle = match select(SERVO_ANGLE.wait(), SERIAL_SERVO_ANGLE.wait()).await {
-            Either::First(angle) => angle,
-            Either::Second(angle) => angle,
-        };
-        servo.set_angle(angle);
-        println!("Servo moved to {} degrees", angle);
-    }
 }
 
 #[embassy_executor::task]
