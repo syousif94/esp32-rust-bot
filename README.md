@@ -1,10 +1,11 @@
-# ESP32 HTTP Servo Controller
+# ESP32 HTTP Servo & Motor Controller
 
-Control an SG90 servo motor via HTTP requests or serial commands using an ESP32 microcontroller, written in Rust with `no_std` embedded development.
+Control an SG90 servo motor and brushless DC motors via HTTP requests or serial commands using an ESP32 microcontroller, written in Rust with `no_std` embedded development.
 
 ## Features
 
 - **HTTP Control**: Set servo angle via GET requests (`/servo/90` or `/servo?angle=90`)
+- **Motor Control**: Control brushless motors via H-bridge (`/motor/a/50` or `/motor/b/-75`)
 - **Serial Control**: Type angle values directly in the serial monitor
 - **WiFi Connected**: Connects to your WiFi network and serves HTTP on port 80
 - **Async Runtime**: Uses Embassy for efficient async/await embedded programming
@@ -13,14 +14,26 @@ Control an SG90 servo motor via HTTP requests or serial commands using an ESP32 
 
 - **ESP32** development board (tested with ESP32-WROOM)
 - **SG90 Servo Motor** (or compatible PWM servo)
+- **Brushless DC Motors** with H-bridge driver (e.g., L298N, TB6612FNG)
 
 ### Wiring
+
+#### Servo
 
 | Servo Wire             | Connection              |
 | ---------------------- | ----------------------- |
 | Red (VCC)              | 3.3/5V power supply     |
 | Brown/Black (GND)      | GND (shared with ESP32) |
 | Orange/Yellow (Signal) | GPIO18                  |
+
+#### Brushless Motors (H-Bridge)
+
+| Motor   | Forward Pin | Reverse Pin | Description                  |
+| ------- | ----------- | ----------- | ---------------------------- |
+| Motor A | GPIO32      | GPIO33      | First motor H-bridge inputs  |
+| Motor B | GPIO25      | GPIO26      | Second motor H-bridge inputs |
+
+Connect your H-bridge driver's input pins to the ESP32 GPIOs, and motor outputs to your brushless motors. Ensure proper power supply for the motors through the H-bridge.
 
 ## Software Requirements
 
@@ -65,6 +78,7 @@ cargo espflash flash --monitor
 Once connected, the ESP32 will print its IP address. Use curl or a browser:
 
 ```bash
+# Servo Control
 # Move to 90 degrees (center)
 curl http://192.168.x.x/servo/90
 
@@ -77,6 +91,22 @@ curl http://192.168.x.x/servo/180
 # Alternative query string format
 curl http://192.168.x.x/servo?angle=45
 
+# Motor Control (H-Bridge)
+# Motor A forward at 75% power
+curl http://192.168.x.x/motor/a/75
+
+# Motor A reverse at 50% power
+curl http://192.168.x.x/motor/a/-50
+
+# Motor B forward at 100% power
+curl http://192.168.x.x/motor/b/100
+
+# Stop Motor A
+curl http://192.168.x.x/motor/a/0
+
+# Alternative query string format
+curl http://192.168.x.x/motor/a?power=80
+
 # Check server status
 curl http://192.168.x.x/
 ```
@@ -85,6 +115,7 @@ curl http://192.168.x.x/
 
 ```json
 { "angle": 90 }
+{ "motor": "a", "power": 75 }
 ```
 
 ### Serial Control
@@ -92,10 +123,19 @@ curl http://192.168.x.x/
 While connected via `cargo espflash flash --monitor`, type commands directly:
 
 ```
-90        # Move to 90 degrees
-0         # Move to 0 degrees
-180       # Move to 180 degrees
-servo 45  # Also works
+# Servo commands
+90           # Move servo to 90 degrees
+0            # Move servo to 0 degrees
+180          # Move servo to 180 degrees
+servo 45     # Also works
+
+# Motor commands
+ma 50        # Motor A forward at 50%
+ma -75       # Motor A reverse at 75%
+mb 100       # Motor B forward at 100%
+mb 0         # Stop Motor B
+motor a 80   # Alternative format
+motor b -50  # Alternative format
 ```
 
 ## Project Structure
@@ -105,6 +145,7 @@ src/
 ├── bin/
 │   └── main.rs        # Entry point, WiFi setup, main loop
 ├── lib.rs             # Library root
+├── brushless.rs       # H-bridge brushless motor control using LEDC
 ├── http_server.rs     # HTTP server and request handling
 ├── serial_cmd.rs      # Serial command parsing
 └── servo.rs           # PWM servo control using LEDC
@@ -122,7 +163,25 @@ The servo is controlled using the ESP32's **LEDC (LED Control)** peripheral, whi
   - 90° → 1.5ms pulse (7.5% duty)
   - 180° → 2.5ms pulse (12.5% duty)
 - **Resolution**: 14-bit for precise angle control
-- **Timer**: HighSpeed LEDC timer with 80MHz APB clock
+- **Timer**: HighSpeed LEDC Timer0 with 80MHz APB clock
+
+### Brushless Motor Control (`brushless.rs`)
+
+Brushless motors are controlled via an H-bridge driver using two PWM channels per motor:
+
+- **Frequency**: 1 kHz - good for responsive H-bridge motor control
+- **Direction Control**:
+  - Forward: Pin A = PWM duty, Pin B = 0%
+  - Reverse: Pin A = 0%, Pin B = PWM duty
+  - Brake: Both pins = 0%
+- **Power Range**: -100% (full reverse) to +100% (full forward)
+- **Resolution**: 14-bit for smooth speed control
+- **Timer**: HighSpeed LEDC Timer1 (separate from servo)
+
+| Motor   | LEDC Channels | GPIO Pins  |
+| ------- | ------------- | ---------- |
+| Motor A | Channel 1, 2  | GPIO32, 33 |
+| Motor B | Channel 3, 4  | GPIO25, 26 |
 
 ### HTTP Server (`http_server.rs`)
 
@@ -140,26 +199,36 @@ A simple async TCP server running on port 80:
 - `GET /health` - Health check
 - `GET /servo/<angle>` - Set servo angle (0-180)
 - `GET /servo?angle=<angle>` - Alternative format
+- `GET /motor/a/<power>` - Set Motor A power (-100 to 100)
+- `GET /motor/b/<power>` - Set Motor B power (-100 to 100)
+- `GET /motor/a?power=<power>` - Alternative format
+- `GET /motor/b?power=<power>` - Alternative format
 
 ### Serial Commands (`serial_cmd.rs`)
 
-Polls UART0 for input and parses simple commands:
+Polls UART0 for input and parses servo and motor commands:
 
 - Runs as an Embassy task
 - Non-blocking read with `read_ready()` check
 - Echoes characters back to terminal
-- Parses numbers or `servo <angle>` format
+
+**Servo formats**: `<angle>`, `servo <angle>`, `s <angle>`
+
+**Motor formats**: `ma <power>`, `mb <power>`, `motor a <power>`, `motor b <power>`
 
 ### Main Loop (`main.rs`)
 
 1. Initializes peripherals (LEDC, UART, WiFi)
-2. Connects to WiFi network
-3. Spawns background tasks:
+2. Sets up servo on GPIO18 (LEDC Timer0, Channel0)
+3. Sets up Motor A on GPIO32/33 (LEDC Timer1, Channel1/2)
+4. Sets up Motor B on GPIO25/26 (LEDC Timer1, Channel3/4)
+5. Connects to WiFi network
+6. Spawns background tasks:
    - WiFi connection manager
    - Network stack runner
    - HTTP server
    - Serial command handler
-4. Main loop uses `embassy_futures::select` to wait for angle updates from either HTTP or serial, then moves the servo
+7. Main loop uses nested `select` combinators to wait for updates from HTTP or serial (6 signal sources), then controls servo/motors
 
 ## Async Execution Model
 
@@ -169,28 +238,44 @@ Polls UART0 for input and parses simple commands:
 
 ```rust
 loop {
-    let angle = match select(SERVO_ANGLE.wait(), SERIAL_SERVO_ANGLE.wait()).await {
-        Either::First(angle) => angle,
-        Either::Second(angle) => angle,
-    };
-    servo.set_angle(angle);
+    match select(
+        select4(
+            SERVO_ANGLE.wait(),
+            SERIAL_SERVO_ANGLE.wait(),
+            MOTOR_A_POWER.wait(),
+            MOTOR_B_POWER.wait(),
+        ),
+        select(
+            SERIAL_MOTOR_A_POWER.wait(),
+            SERIAL_MOTOR_B_POWER.wait(),
+        ),
+    ).await {
+        Either::First(Either4::First(angle)) => servo.set_angle(angle),
+        Either::First(Either4::Second(angle)) => servo.set_angle(angle),
+        Either::First(Either4::Third(power)) => motor_a.set_power(power),
+        Either::First(Either4::Fourth(power)) => motor_b.set_power(power),
+        Either::Second(Either::First(power)) => motor_a.set_power(power),
+        Either::Second(Either::Second(power)) => motor_b.set_power(power),
+    }
 }
 ```
 
 When execution hits `.await`, the task **yields** and the CPU can sleep or run other tasks. The main task only wakes when:
 
-- The HTTP server signals a new angle via `SERVO_ANGLE.signal(angle)`
-- The serial handler signals via `SERIAL_SERVO_ANGLE.signal(angle)`
+- The HTTP server signals a new servo angle via `SERVO_ANGLE.signal(angle)`
+- The serial handler signals servo via `SERIAL_SERVO_ANGLE.signal(angle)`
+- The HTTP server signals motor power via `MOTOR_A_POWER.signal(power)` or `MOTOR_B_POWER.signal(power)`
+- The serial handler signals motor power via `SERIAL_MOTOR_A_POWER.signal(power)` or `SERIAL_MOTOR_B_POWER.signal(power)`
 
-### How `select()` Works
+### How Nested `select()` Works
 
-`select()` is a **future combinator** that polls both futures concurrently:
+We use nested `select` combinators to handle 6 signal sources (more than `select4` supports):
 
-1. Both `SERVO_ANGLE.wait()` and `SERIAL_SERVO_ANGLE.wait()` are checked
-2. When **either** completes, `select()` returns immediately with that result
-3. The other future is dropped (but its signal remains for next iteration)
+1. All six signal `.wait()` futures are polled concurrently via nested selects
+2. When **any one** completes, the nested select returns immediately with that result
+3. The other futures are dropped (but their signals remain for next iteration)
 
-This is **not busy-polling**. If neither signal is ready, the executor puts the task to sleep.
+This is **not busy-polling**. If no signal is ready, the executor puts the task to sleep.
 
 ### Embassy Executor Model
 

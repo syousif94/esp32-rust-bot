@@ -8,12 +8,26 @@ use embassy_sync::signal::Signal;
 /// Signal for servo angle updates from serial
 pub static SERIAL_SERVO_ANGLE: Signal<CriticalSectionRawMutex, u8> = Signal::new();
 
+/// Signal for motor A power updates from serial
+pub static SERIAL_MOTOR_A_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
+
+/// Signal for motor B power updates from serial
+pub static SERIAL_MOTOR_B_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
+
+/// Parsed command from serial input
+enum SerialCommand {
+    Servo(u8),
+    MotorA(i8),
+    MotorB(i8),
+    MotorBoth(i8),
+}
+
 /// Parse a servo command from input
 /// Accepts formats like: "90", "servo 90", "angle 90", "s90", "a90"
 fn parse_servo_command(input: &str) -> Option<u8> {
     let input = input.trim();
     
-    // Try direct number
+    // Try direct number (only positive, for servo)
     if let Ok(angle) = input.parse::<u8>() {
         if angle <= 180 {
             return Some(angle);
@@ -34,12 +48,86 @@ fn parse_servo_command(input: &str) -> Option<u8> {
     None
 }
 
-/// Task to read serial input and parse servo commands
+/// Parse a motor command from input
+/// Accepts formats like: "ma 50", "mb -75", "motor a 100", "motor b -50", "m 50" (both motors)
+fn parse_motor_command(input: &str) -> Option<(char, i8)> {
+    let input = input.trim().to_lowercase();
+    
+    // Try "m X" format for both motors (must check before "ma"/"mb")
+    // Make sure it's not "ma" or "mb"
+    if let Some(rest) = input.strip_prefix("m ") {
+        if let Ok(power) = rest.trim().parse::<i8>() {
+            if power >= -100 && power <= 100 {
+                return Some(('*', power)); // '*' means both motors
+            }
+        }
+    }
+    
+    // Try "ma X" or "mb X" format
+    if let Some(rest) = input.strip_prefix("ma ") {
+        if let Ok(power) = rest.trim().parse::<i8>() {
+            if power >= -100 && power <= 100 {
+                return Some(('a', power));
+            }
+        }
+    }
+    if let Some(rest) = input.strip_prefix("mb ") {
+        if let Ok(power) = rest.trim().parse::<i8>() {
+            if power >= -100 && power <= 100 {
+                return Some(('b', power));
+            }
+        }
+    }
+    
+    // Try "motor a X" or "motor b X" format
+    if let Some(rest) = input.strip_prefix("motor ") {
+        let rest = rest.trim();
+        if let Some(power_str) = rest.strip_prefix("a ") {
+            if let Ok(power) = power_str.trim().parse::<i8>() {
+                if power >= -100 && power <= 100 {
+                    return Some(('a', power));
+                }
+            }
+        }
+        if let Some(power_str) = rest.strip_prefix("b ") {
+            if let Ok(power) = power_str.trim().parse::<i8>() {
+                if power >= -100 && power <= 100 {
+                    return Some(('b', power));
+                }
+            }
+        }
+    }
+    
+    None
+}
+
+/// Parse any serial command
+fn parse_command(input: &str) -> Option<SerialCommand> {
+    // Try motor command first (to avoid "ma" being parsed as servo)
+    if let Some((motor, power)) = parse_motor_command(input) {
+        return match motor {
+            'a' => Some(SerialCommand::MotorA(power)),
+            'b' => Some(SerialCommand::MotorB(power)),
+            '*' => Some(SerialCommand::MotorBoth(power)),
+            _ => None,
+        };
+    }
+    
+    // Try servo command
+    if let Some(angle) = parse_servo_command(input) {
+        return Some(SerialCommand::Servo(angle));
+    }
+    
+    None
+}
+
+/// Task to read serial input and parse servo/motor commands
 #[embassy_executor::task]
 pub async fn serial_input_task(mut uart: Uart<'static, Blocking>) {
     println!("Serial command interface ready");
-    println!("  Commands: <angle> or 'servo <angle>' (0-180)");
-    println!("  Example: 90");
+    println!("  Servo:  <angle> or 'servo <angle>' (0-180)");
+    println!("  Motor:  'm <power>' (both), 'ma <power>', 'mb <power>' (-100 to 100)");
+    println!("  Examples: 90, m 50, ma 75, mb -50");
     
     let mut buffer = [0u8; 64];
     let mut pos = 0usize;
@@ -60,11 +148,29 @@ pub async fn serial_input_task(mut uart: Uart<'static, Blocking>) {
                         if pos > 0 {
                             // Try to parse the command
                             if let Ok(cmd) = core::str::from_utf8(&buffer[..pos]) {
-                                if let Some(angle) = parse_servo_command(cmd) {
-                                    println!("\nSerial: Setting servo to {} degrees", angle);
-                                    SERIAL_SERVO_ANGLE.signal(angle);
-                                } else if !cmd.trim().is_empty() {
-                                    println!("\nUnknown command: '{}'. Use 0-180 for angle.", cmd);
+                                match parse_command(cmd) {
+                                    Some(SerialCommand::Servo(angle)) => {
+                                        println!("\nSerial: Setting servo to {} degrees", angle);
+                                        SERIAL_SERVO_ANGLE.signal(angle);
+                                    }
+                                    Some(SerialCommand::MotorA(power)) => {
+                                        println!("\nSerial: Setting motor A to {}%", power);
+                                        SERIAL_MOTOR_A_POWER.signal(power);
+                                    }
+                                    Some(SerialCommand::MotorB(power)) => {
+                                        println!("\nSerial: Setting motor B to {}%", power);
+                                        SERIAL_MOTOR_B_POWER.signal(power);
+                                    }
+                                    Some(SerialCommand::MotorBoth(power)) => {
+                                        println!("\nSerial: Setting both motors to {}%", power);
+                                        SERIAL_MOTOR_A_POWER.signal(power);
+                                        SERIAL_MOTOR_B_POWER.signal(power);
+                                    }
+                                    None => {
+                                        if !cmd.trim().is_empty() {
+                                            println!("\nUnknown command: '{}'. Use 0-180 for servo, 'm/ma/mb <-100 to 100>' for motors.", cmd);
+                                        }
+                                    }
                                 }
                             }
                             pos = 0;

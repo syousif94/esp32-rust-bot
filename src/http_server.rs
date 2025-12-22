@@ -12,6 +12,12 @@ const TX_BUFFER_SIZE: usize = 1024;
 /// Signal for servo angle updates
 pub static SERVO_ANGLE: Signal<CriticalSectionRawMutex, u8> = Signal::new();
 
+/// Signal for motor A power updates (-100 to +100)
+pub static MOTOR_A_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
+
+/// Signal for motor B power updates (-100 to +100)
+pub static MOTOR_B_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
+
 /// Simple HTTP response builder
 fn build_response(status: &str, content_type: &str, body: &str) -> alloc::string::String {
     alloc::format!(
@@ -51,6 +57,42 @@ fn parse_servo_angle(path: &str) -> Option<u8> {
     None
 }
 
+/// Parse motor power from path like /motor/a/50 or /motor/a?power=50
+/// Returns (motor_id, power) where motor_id is 'a' or 'b' and power is -100 to 100
+fn parse_motor_power(path: &str) -> Option<(char, i8)> {
+    // Try path format: /motor/a/50 or /motor/b/-50
+    if let Some(rest) = path.strip_prefix("/motor/") {
+        let mut parts = rest.split('/');
+        let motor_id = parts.next()?.chars().next()?;
+        if motor_id != 'a' && motor_id != 'b' {
+            return None;
+        }
+        if let Some(power_str) = parts.next() {
+            let power: i8 = power_str.parse().ok()?;
+            return Some((motor_id, power));
+        }
+    }
+    
+    // Try query format: /motor/a?power=50
+    if path.starts_with("/motor/") {
+        let rest = path.strip_prefix("/motor/")?;
+        let motor_id = rest.chars().next()?;
+        if motor_id != 'a' && motor_id != 'b' {
+            return None;
+        }
+        if rest.contains('?') {
+            for part in rest.split('?').nth(1)?.split('&') {
+                if let Some(value) = part.strip_prefix("power=") {
+                    let power: i8 = value.parse().ok()?;
+                    return Some((motor_id, power));
+                }
+            }
+        }
+    }
+    
+    None
+}
+
 /// Handle an incoming HTTP request and return a response
 fn handle_request(request: &str) -> alloc::string::String {
     let Some((method, path)) = parse_request(request) else {
@@ -62,11 +104,29 @@ fn handle_request(request: &str) -> alloc::string::String {
     match method {
         "GET" => {
             if path == "/" {
-                let body = r#"{"status": "ok", "message": "ESP32 Servo Controller", "endpoints": ["/servo/<angle>", "/servo?angle=<0-180>"]}"#;
+                let body = r#"{"status": "ok", "message": "ESP32 Motor & Servo Controller", "endpoints": ["/servo/<angle>", "/servo?angle=<0-180>", "/motor/a/<power>", "/motor/b/<power>", "/motor/a?power=<-100 to 100>", "/motor/b?power=<-100 to 100>"]}"#;
                 build_response("200 OK", "application/json", body)
             } else if path == "/health" {
                 let body = r#"{"healthy": true}"#;
                 build_response("200 OK", "application/json", body)
+            } else if path.starts_with("/motor/") {
+                if let Some((motor_id, power)) = parse_motor_power(path) {
+                    if power >= -100 && power <= 100 {
+                        match motor_id {
+                            'a' => MOTOR_A_POWER.signal(power),
+                            'b' => MOTOR_B_POWER.signal(power),
+                            _ => unreachable!(),
+                        }
+                        let body = alloc::format!(r#"{{"motor": "{}", "power": {}}}"#, motor_id, power);
+                        build_response("200 OK", "application/json", &body)
+                    } else {
+                        let body = r#"{"error": "Power must be between -100 and 100"}"#;
+                        build_response("400 Bad Request", "application/json", body)
+                    }
+                } else {
+                    let body = r#"{"error": "Missing or invalid power parameter. Use /motor/a/50 or /motor/a?power=50"}"#;
+                    build_response("400 Bad Request", "application/json", body)
+                }
             } else if path.starts_with("/servo") {
                 if let Some(angle) = parse_servo_angle(path) {
                     if angle <= 180 {
