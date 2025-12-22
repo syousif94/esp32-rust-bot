@@ -18,6 +18,12 @@ pub static MOTOR_A_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
 /// Signal for motor B power updates (-100 to +100)
 pub static MOTOR_B_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
 
+/// Signal for motor C power updates (-100 to +100)
+pub static MOTOR_C_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
+
+/// Signal for motor D power updates (-100 to +100)
+pub static MOTOR_D_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
+
 /// Simple HTTP response builder
 fn build_response(status: &str, content_type: &str, body: &str) -> alloc::string::String {
     alloc::format!(
@@ -58,13 +64,13 @@ fn parse_servo_angle(path: &str) -> Option<u8> {
 }
 
 /// Parse motor power from path like /motor/a/50 or /motor/a?power=50
-/// Returns (motor_id, power) where motor_id is 'a' or 'b' and power is -100 to 100
+/// Returns (motor_id, power) where motor_id is 'a', 'b', 'c', or 'd' and power is -100 to 100
 fn parse_motor_power(path: &str) -> Option<(char, i8)> {
     // Try path format: /motor/a/50 or /motor/b/-50
     if let Some(rest) = path.strip_prefix("/motor/") {
         let mut parts = rest.split('/');
         let motor_id = parts.next()?.chars().next()?;
-        if motor_id != 'a' && motor_id != 'b' {
+        if motor_id != 'a' && motor_id != 'b' && motor_id != 'c' && motor_id != 'd' {
             return None;
         }
         if let Some(power_str) = parts.next() {
@@ -77,7 +83,7 @@ fn parse_motor_power(path: &str) -> Option<(char, i8)> {
     if path.starts_with("/motor/") {
         let rest = path.strip_prefix("/motor/")?;
         let motor_id = rest.chars().next()?;
-        if motor_id != 'a' && motor_id != 'b' {
+        if motor_id != 'a' && motor_id != 'b' && motor_id != 'c' && motor_id != 'd' {
             return None;
         }
         if rest.contains('?') {
@@ -104,7 +110,7 @@ fn handle_request(request: &str) -> alloc::string::String {
     match method {
         "GET" => {
             if path == "/" {
-                let body = r#"{"status": "ok", "message": "ESP32 Motor & Servo Controller", "endpoints": ["/servo/<angle>", "/servo?angle=<0-180>", "/motor/a/<power>", "/motor/b/<power>", "/motor/a?power=<-100 to 100>", "/motor/b?power=<-100 to 100>"]}"#;
+                let body = r#"{"status": "ok", "message": "ESP32 Motor & Servo Controller", "endpoints": ["/servo/<angle>", "/servo?angle=<0-180>", "/motor/a/<power>", "/motor/b/<power>", "/motor/c/<power>", "/motor/d/<power>", "/motor/<a|b|c|d>?power=<-100 to 100>"]}"#;
                 build_response("200 OK", "application/json", body)
             } else if path == "/health" {
                 let body = r#"{"healthy": true}"#;
@@ -115,6 +121,8 @@ fn handle_request(request: &str) -> alloc::string::String {
                         match motor_id {
                             'a' => MOTOR_A_POWER.signal(power),
                             'b' => MOTOR_B_POWER.signal(power),
+                            'c' => MOTOR_C_POWER.signal(power),
+                            'd' => MOTOR_D_POWER.signal(power),
                             _ => unreachable!(),
                         }
                         let body = alloc::format!(r#"{{"motor": "{}", "power": {}}}"#, motor_id, power);

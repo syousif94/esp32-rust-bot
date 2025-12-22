@@ -28,8 +28,8 @@ use esp_radio::wifi::{
 };
 use static_cell::StaticCell;
 use esp32_http_servo::brushless::{BrushlessMotor, init_motor_timer};
-use esp32_http_servo::http_server::{http_server_task, SERVO_ANGLE, MOTOR_A_POWER, MOTOR_B_POWER};
-use esp32_http_servo::serial_cmd::{serial_input_task, SERIAL_SERVO_ANGLE, SERIAL_MOTOR_A_POWER, SERIAL_MOTOR_B_POWER};
+use esp32_http_servo::http_server::{http_server_task, SERVO_ANGLE, MOTOR_A_POWER, MOTOR_B_POWER, MOTOR_C_POWER, MOTOR_D_POWER};
+use esp32_http_servo::serial_cmd::{serial_input_task, SERIAL_SERVO_ANGLE, SERIAL_MOTOR_A_POWER, SERIAL_MOTOR_B_POWER, SERIAL_MOTOR_C_POWER, SERIAL_MOTOR_D_POWER};
 use esp32_http_servo::servo::{ServoController, init_servo_timer};
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
@@ -106,6 +106,28 @@ async fn main(spawner: Spawner) -> ! {
         "Motor B",
     );
     println!("Motor B initialized on GPIO25/GPIO26");
+    
+    // Initialize Motor C on GPIO19 (forward) and GPIO21 (reverse)
+    let mut motor_c = BrushlessMotor::new(
+        motor_timer,
+        peripherals.GPIO19,
+        peripherals.GPIO21,
+        esp_hal::ledc::channel::Number::Channel5,
+        esp_hal::ledc::channel::Number::Channel6,
+        "Motor C",
+    );
+    println!("Motor C initialized on GPIO19/GPIO21");
+    
+    // Initialize Motor D on GPIO22 (forward) and GPIO23 (reverse)
+    let mut motor_d = BrushlessMotor::new(
+        motor_timer,
+        peripherals.GPIO22,
+        peripherals.GPIO23,
+        esp_hal::ledc::channel::Number::Channel7,
+        esp_hal::ledc::channel::Number::Channel0,
+        "Motor D",
+    );
+    println!("Motor D initialized on GPIO22/GPIO23");
 
     // Initialize esp-radio controller
     let esp_radio_controller = mk_static!(esp_radio::Controller<'static>, esp_radio::init().unwrap());
@@ -143,8 +165,8 @@ async fn main(spawner: Spawner) -> ! {
     // Main loop - handle servo and motor updates from HTTP or serial
     // This runs immediately, allowing serial control before WiFi connects
     loop {
-        // Wait for signal from any source: servo (HTTP/serial) or motors (HTTP/serial)
-        // Use nested select to handle 6 signals (select4 + select for remaining 2)
+        // Wait for signal from any source: servo (HTTP/serial) or motors A-D (HTTP/serial)
+        // Use nested select to handle 10 signals
         match select(
             select4(
                 SERVO_ANGLE.wait(),
@@ -153,8 +175,16 @@ async fn main(spawner: Spawner) -> ! {
                 MOTOR_B_POWER.wait(),
             ),
             select(
-                SERIAL_MOTOR_A_POWER.wait(),
-                SERIAL_MOTOR_B_POWER.wait(),
+                select4(
+                    MOTOR_C_POWER.wait(),
+                    MOTOR_D_POWER.wait(),
+                    SERIAL_MOTOR_A_POWER.wait(),
+                    SERIAL_MOTOR_B_POWER.wait(),
+                ),
+                select(
+                    SERIAL_MOTOR_C_POWER.wait(),
+                    SERIAL_MOTOR_D_POWER.wait(),
+                ),
             ),
         ).await {
             Either::First(Either4::First(angle)) => {
@@ -173,13 +203,29 @@ async fn main(spawner: Spawner) -> ! {
                 motor_b.set_power(power);
                 println!("Motor B set to {}%", power);
             }
-            Either::Second(Either::First(power)) => {
+            Either::Second(Either::First(Either4::First(power))) => {
+                motor_c.set_power(power);
+                println!("Motor C set to {}%", power);
+            }
+            Either::Second(Either::First(Either4::Second(power))) => {
+                motor_d.set_power(power);
+                println!("Motor D set to {}%", power);
+            }
+            Either::Second(Either::First(Either4::Third(power))) => {
                 motor_a.set_power(power);
                 println!("Motor A set to {}% (serial)", power);
             }
-            Either::Second(Either::Second(power)) => {
+            Either::Second(Either::First(Either4::Fourth(power))) => {
                 motor_b.set_power(power);
                 println!("Motor B set to {}% (serial)", power);
+            }
+            Either::Second(Either::Second(Either::First(power))) => {
+                motor_c.set_power(power);
+                println!("Motor C set to {}% (serial)", power);
+            }
+            Either::Second(Either::Second(Either::Second(power))) => {
+                motor_d.set_power(power);
+                println!("Motor D set to {}% (serial)", power);
             }
         }
     }

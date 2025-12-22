@@ -14,12 +14,20 @@ pub static SERIAL_MOTOR_A_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::n
 /// Signal for motor B power updates from serial
 pub static SERIAL_MOTOR_B_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
 
+/// Signal for motor C power updates from serial
+pub static SERIAL_MOTOR_C_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
+
+/// Signal for motor D power updates from serial
+pub static SERIAL_MOTOR_D_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
+
 /// Parsed command from serial input
 enum SerialCommand {
     Servo(u8),
     MotorA(i8),
     MotorB(i8),
-    MotorBoth(i8),
+    MotorC(i8),
+    MotorD(i8),
+    MotorAll(i8),
 }
 
 /// Parse a servo command from input
@@ -49,50 +57,40 @@ fn parse_servo_command(input: &str) -> Option<u8> {
 }
 
 /// Parse a motor command from input
-/// Accepts formats like: "ma 50", "mb -75", "motor a 100", "motor b -50", "m 50" (both motors)
+/// Accepts formats like: "ma 50", "mb -75", "mc 100", "md -50", "motor a 100", "motor b -50", "m 50" (all motors)
 fn parse_motor_command(input: &str) -> Option<(char, i8)> {
     let input = input.trim().to_lowercase();
     
-    // Try "m X" format for both motors (must check before "ma"/"mb")
-    // Make sure it's not "ma" or "mb"
+    // Try "m X" format for all motors (must check before "ma"/"mb"/"mc"/"md")
+    // Make sure it's not "ma", "mb", "mc", or "md"
     if let Some(rest) = input.strip_prefix("m ") {
         if let Ok(power) = rest.trim().parse::<i8>() {
             if power >= -100 && power <= 100 {
-                return Some(('*', power)); // '*' means both motors
+                return Some(('*', power)); // '*' means all motors
             }
         }
     }
     
-    // Try "ma X" or "mb X" format
-    if let Some(rest) = input.strip_prefix("ma ") {
-        if let Ok(power) = rest.trim().parse::<i8>() {
-            if power >= -100 && power <= 100 {
-                return Some(('a', power));
-            }
-        }
-    }
-    if let Some(rest) = input.strip_prefix("mb ") {
-        if let Ok(power) = rest.trim().parse::<i8>() {
-            if power >= -100 && power <= 100 {
-                return Some(('b', power));
-            }
-        }
-    }
-    
-    // Try "motor a X" or "motor b X" format
-    if let Some(rest) = input.strip_prefix("motor ") {
-        let rest = rest.trim();
-        if let Some(power_str) = rest.strip_prefix("a ") {
-            if let Ok(power) = power_str.trim().parse::<i8>() {
+    // Try "ma X", "mb X", "mc X", "md X" format
+    for (prefix, motor_id) in [("ma ", 'a'), ("mb ", 'b'), ("mc ", 'c'), ("md ", 'd')] {
+        if let Some(rest) = input.strip_prefix(prefix) {
+            if let Ok(power) = rest.trim().parse::<i8>() {
                 if power >= -100 && power <= 100 {
-                    return Some(('a', power));
+                    return Some((motor_id, power));
                 }
             }
         }
-        if let Some(power_str) = rest.strip_prefix("b ") {
-            if let Ok(power) = power_str.trim().parse::<i8>() {
-                if power >= -100 && power <= 100 {
-                    return Some(('b', power));
+    }
+    
+    // Try "motor a X", "motor b X", "motor c X", "motor d X" format
+    if let Some(rest) = input.strip_prefix("motor ") {
+        let rest = rest.trim();
+        for (prefix, motor_id) in [("a ", 'a'), ("b ", 'b'), ("c ", 'c'), ("d ", 'd')] {
+            if let Some(power_str) = rest.strip_prefix(prefix) {
+                if let Ok(power) = power_str.trim().parse::<i8>() {
+                    if power >= -100 && power <= 100 {
+                        return Some((motor_id, power));
+                    }
                 }
             }
         }
@@ -108,7 +106,9 @@ fn parse_command(input: &str) -> Option<SerialCommand> {
         return match motor {
             'a' => Some(SerialCommand::MotorA(power)),
             'b' => Some(SerialCommand::MotorB(power)),
-            '*' => Some(SerialCommand::MotorBoth(power)),
+            'c' => Some(SerialCommand::MotorC(power)),
+            'd' => Some(SerialCommand::MotorD(power)),
+            '*' => Some(SerialCommand::MotorAll(power)),
             _ => None,
         };
     }
@@ -126,8 +126,8 @@ fn parse_command(input: &str) -> Option<SerialCommand> {
 pub async fn serial_input_task(mut uart: Uart<'static, Blocking>) {
     println!("Serial command interface ready");
     println!("  Servo:  <angle> or 'servo <angle>' (0-180)");
-    println!("  Motor:  'm <power>' (both), 'ma <power>', 'mb <power>' (-100 to 100)");
-    println!("  Examples: 90, m 50, ma 75, mb -50");
+    println!("  Motor:  'm <power>' (all), 'ma/mb/mc/md <power>' (-100 to 100)");
+    println!("  Examples: 90, m 50, ma 75, mb -50, mc 100, md -25");
     
     let mut buffer = [0u8; 64];
     let mut pos = 0usize;
@@ -161,14 +161,24 @@ pub async fn serial_input_task(mut uart: Uart<'static, Blocking>) {
                                         println!("\nSerial: Setting motor B to {}%", power);
                                         SERIAL_MOTOR_B_POWER.signal(power);
                                     }
-                                    Some(SerialCommand::MotorBoth(power)) => {
-                                        println!("\nSerial: Setting both motors to {}%", power);
+                                    Some(SerialCommand::MotorC(power)) => {
+                                        println!("\nSerial: Setting motor C to {}%", power);
+                                        SERIAL_MOTOR_C_POWER.signal(power);
+                                    }
+                                    Some(SerialCommand::MotorD(power)) => {
+                                        println!("\nSerial: Setting motor D to {}%", power);
+                                        SERIAL_MOTOR_D_POWER.signal(power);
+                                    }
+                                    Some(SerialCommand::MotorAll(power)) => {
+                                        println!("\nSerial: Setting all motors to {}%", power);
                                         SERIAL_MOTOR_A_POWER.signal(power);
                                         SERIAL_MOTOR_B_POWER.signal(power);
+                                        SERIAL_MOTOR_C_POWER.signal(power);
+                                        SERIAL_MOTOR_D_POWER.signal(power);
                                     }
                                     None => {
                                         if !cmd.trim().is_empty() {
-                                            println!("\nUnknown command: '{}'. Use 0-180 for servo, 'm/ma/mb <-100 to 100>' for motors.", cmd);
+                                            println!("\nUnknown command: '{}'. Use 0-180 for servo, 'm/ma/mb/mc/md <-100 to 100>' for motors.", cmd);
                                         }
                                     }
                                 }
