@@ -28,6 +28,10 @@ embassy-sync = "0.7.2"
 embassy-futures = "0.1.2"
 embedded-io = "0.7.1"
 
+# OLED display support
+embedded-graphics = "0.8"
+ssd1306 = "0.9"
+heapless = "0.8"
 
 [profile.dev]
 # Rust debug is too slow.

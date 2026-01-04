@@ -11,8 +11,10 @@ use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
+    i2c::master::{Config as I2cConfig, I2c},
     ledc::Ledc,
     rng::Rng,
+    time::Rate,
     timer::timg::TimerGroup,
     uart::{Uart, Config as UartConfig},
 };
@@ -28,6 +30,7 @@ use esp_radio::wifi::{
 };
 use static_cell::StaticCell;
 use esp32_http_servo::brushless::{BrushlessMotor, init_motor_timer};
+use esp32_http_servo::display::{display_task, init_display_state, update_motor_a, update_motor_b, update_motor_c, update_motor_d, update_ip, DisplaySender};
 use esp32_http_servo::http_server::{http_server_task, SERVO_ANGLE, MOTOR_A_POWER, MOTOR_B_POWER, MOTOR_C_POWER, MOTOR_D_POWER};
 use esp32_http_servo::serial_cmd::{serial_input_task, SERIAL_SERVO_ANGLE, SERIAL_MOTOR_A_POWER, SERIAL_MOTOR_B_POWER, SERIAL_MOTOR_C_POWER, SERIAL_MOTOR_D_POWER};
 use esp32_http_servo::servo::{ServoController, init_servo_timer};
@@ -129,6 +132,19 @@ async fn main(spawner: Spawner) -> ! {
     );
     println!("Motor D initialized on GPIO22/GPIO23");
 
+    // Initialize I2C for OLED display (GPIO4 = SDA, GPIO5 = SCL)
+    let i2c_config = I2cConfig::default().with_frequency(Rate::from_khz(100));
+    let i2c = I2c::new(peripherals.I2C0, i2c_config)
+        .unwrap()
+        .with_sda(peripherals.GPIO4)
+        .with_scl(peripherals.GPIO5);
+    println!("I2C initialized on GPIO4 (SDA) / GPIO5 (SCL) at 100kHz");
+
+    // Initialize display state and spawn display task
+    let display_sender = init_display_state();
+    spawner.spawn(display_task(i2c, SSID)).ok();
+    println!("OLED display task spawned");
+
     // Initialize esp-radio controller
     let esp_radio_controller = mk_static!(esp_radio::Controller<'static>, esp_radio::init().unwrap());
 
@@ -160,7 +176,7 @@ async fn main(spawner: Spawner) -> ! {
     // Spawn background tasks
     spawner.spawn(connection(controller)).ok();
     spawner.spawn(net_task(runner)).ok();
-    spawner.spawn(wifi_ready_task(spawner, stack)).ok();
+    spawner.spawn(wifi_ready_task(spawner, stack, display_sender.clone())).ok();
 
     // Main loop - handle servo and motor updates from HTTP or serial
     // This runs immediately, allowing serial control before WiFi connects
@@ -197,34 +213,42 @@ async fn main(spawner: Spawner) -> ! {
             }
             Either::First(Either4::Third(power)) => {
                 motor_a.set_power(power);
+                update_motor_a(&display_sender, power);
                 println!("Motor A set to {}%", power);
             }
             Either::First(Either4::Fourth(power)) => {
                 motor_b.set_power(power);
+                update_motor_b(&display_sender, power);
                 println!("Motor B set to {}%", power);
             }
             Either::Second(Either::First(Either4::First(power))) => {
                 motor_c.set_power(power);
+                update_motor_c(&display_sender, power);
                 println!("Motor C set to {}%", power);
             }
             Either::Second(Either::First(Either4::Second(power))) => {
                 motor_d.set_power(power);
+                update_motor_d(&display_sender, power);
                 println!("Motor D set to {}%", power);
             }
             Either::Second(Either::First(Either4::Third(power))) => {
                 motor_a.set_power(power);
+                update_motor_a(&display_sender, power);
                 println!("Motor A set to {}% (serial)", power);
             }
             Either::Second(Either::First(Either4::Fourth(power))) => {
                 motor_b.set_power(power);
+                update_motor_b(&display_sender, power);
                 println!("Motor B set to {}% (serial)", power);
             }
             Either::Second(Either::Second(Either::First(power))) => {
                 motor_c.set_power(power);
+                update_motor_c(&display_sender, power);
                 println!("Motor C set to {}% (serial)", power);
             }
             Either::Second(Either::Second(Either::Second(power))) => {
                 motor_d.set_power(power);
+                update_motor_d(&display_sender, power);
                 println!("Motor D set to {}% (serial)", power);
             }
         }
@@ -232,7 +256,11 @@ async fn main(spawner: Spawner) -> ! {
 }
 
 #[embassy_executor::task]
-async fn wifi_ready_task(spawner: Spawner, stack: embassy_net::Stack<'static>) {
+async fn wifi_ready_task(
+    spawner: Spawner, 
+    stack: embassy_net::Stack<'static>,
+    display_sender: DisplaySender,
+) {
     // Wait for link to be up
     loop {
         if stack.is_link_up() {
@@ -245,6 +273,9 @@ async fn wifi_ready_task(spawner: Spawner, stack: embassy_net::Stack<'static>) {
     loop {
         if let Some(config) = stack.config_v4() {
             println!("Got IP: {}", config.address);
+            // Update display with IP address
+            let ip = config.address.address();
+            update_ip(&display_sender, ip.octets());
             break;
         }
         Timer::after(Duration::from_millis(500)).await;
