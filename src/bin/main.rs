@@ -30,6 +30,8 @@ use esp_radio::wifi::{
     sta_state,
 };
 use static_cell::StaticCell;
+use esp_radio::ble::controller::BleConnector;
+use esp32_http_servo::ble::{ble_task, BLE_SERVO_ANGLE, BLE_MOTOR_A_POWER, BLE_MOTOR_B_POWER, BLE_MOTOR_C_POWER, BLE_MOTOR_D_POWER};
 use esp32_http_servo::brushless::{BrushlessMotor, init_motor_timer};
 use esp32_http_servo::display::{display_task, init_display_state, update_motor_a, update_motor_b, update_motor_c, update_motor_d, update_ip, update_dots, update_status, WifiStatus, DisplaySender};
 use esp32_http_servo::http_server::{http_server_task, SERVO_ANGLE, MOTOR_A_POWER, MOTOR_B_POWER, MOTOR_C_POWER, MOTOR_D_POWER};
@@ -56,7 +58,10 @@ async fn main(spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(config);
 
     // Initialize heap allocator
-    esp_alloc::heap_allocator!(size: 72 * 1024);
+    // NOTE: 64KB heap balances WiFi/radio memory needs with stack space.
+    // BLE large objects are in static cells, but the Server struct is temporarily
+    // constructed on the stack before being moved, requiring extra headroom.
+    esp_alloc::heap_allocator!(size: 64 * 1024);
 
     // Initialize timer and software interrupt for esp-rtos
     let timg0 = TimerGroup::new(peripherals.TIMG0);
@@ -146,8 +151,16 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(display_task(i2c, SSID)).ok();
     println!("OLED display task spawned");
 
-    // Initialize esp-radio controller
+    // Initialize esp-radio controller (shared by WiFi and BLE)
     let esp_radio_controller = mk_static!(esp_radio::Controller<'static>, esp_radio::init().unwrap());
+
+    // Initialize BLE connector (must be created alongside WiFi for coex)
+    let connector = BleConnector::new(
+        esp_radio_controller,
+        peripherals.BT,
+        Default::default(),
+    ).unwrap();
+    println!("BLE connector initialized");
 
     // Initialize WiFi
     let (controller, interfaces) = esp_radio::wifi::new(
@@ -175,83 +188,139 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     // Spawn background tasks
+    spawner.spawn(ble_task(connector)).ok();
+    println!("BLE task spawned");
     spawner.spawn(connection(controller, display_sender.clone())).ok();
     spawner.spawn(net_task(runner)).ok();
     spawner.spawn(wifi_ready_task(spawner, stack, display_sender.clone())).ok();
 
-    // Main loop - handle servo and motor updates from HTTP or serial
-    // This runs immediately, allowing serial control before WiFi connects
+    // Main loop - handle servo and motor updates from HTTP, serial, or BLE
+    // This runs immediately, allowing serial/BLE control before WiFi connects
     loop {
-        // Wait for signal from any source: servo (HTTP/serial) or motors A-D (HTTP/serial)
-        // Use nested select to handle 10 signals
+        // Wait for signal from any source: servo or motors A-D (HTTP/serial/BLE)
+        // Use nested select to handle 15 signals
         match select(
-            select4(
-                SERVO_ANGLE.wait(),
-                SERIAL_SERVO_ANGLE.wait(),
-                MOTOR_A_POWER.wait(),
-                MOTOR_B_POWER.wait(),
-            ),
             select(
                 select4(
+                    SERVO_ANGLE.wait(),
+                    SERIAL_SERVO_ANGLE.wait(),
+                    BLE_SERVO_ANGLE.wait(),
+                    MOTOR_A_POWER.wait(),
+                ),
+                select4(
+                    MOTOR_B_POWER.wait(),
                     MOTOR_C_POWER.wait(),
                     MOTOR_D_POWER.wait(),
                     SERIAL_MOTOR_A_POWER.wait(),
-                    SERIAL_MOTOR_B_POWER.wait(),
                 ),
-                select(
+            ),
+            select(
+                select4(
+                    SERIAL_MOTOR_B_POWER.wait(),
                     SERIAL_MOTOR_C_POWER.wait(),
                     SERIAL_MOTOR_D_POWER.wait(),
+                    BLE_MOTOR_A_POWER.wait(),
+                ),
+                select4(
+                    BLE_MOTOR_B_POWER.wait(),
+                    BLE_MOTOR_C_POWER.wait(),
+                    BLE_MOTOR_D_POWER.wait(),
+                    embassy_futures::select::select(
+                        embassy_futures::yield_now(),
+                        core::future::pending::<()>(),
+                    ),
                 ),
             ),
         ).await {
-            Either::First(Either4::First(angle)) => {
+            // HTTP servo
+            Either::First(Either::First(Either4::First(angle))) => {
                 servo.set_angle(angle);
                 println!("Servo moved to {} degrees", angle);
             }
-            Either::First(Either4::Second(angle)) => {
+            // Serial servo
+            Either::First(Either::First(Either4::Second(angle))) => {
                 servo.set_angle(angle);
                 println!("Servo moved to {} degrees (serial)", angle);
             }
-            Either::First(Either4::Third(power)) => {
+            // BLE servo
+            Either::First(Either::First(Either4::Third(angle))) => {
+                servo.set_angle(angle);
+                println!("Servo moved to {} degrees (BLE)", angle);
+            }
+            // HTTP Motor A
+            Either::First(Either::First(Either4::Fourth(power))) => {
                 motor_a.set_power(power);
                 update_motor_a(&display_sender, power);
                 println!("Motor A set to {}%", power);
             }
-            Either::First(Either4::Fourth(power)) => {
+            // HTTP Motor B
+            Either::First(Either::Second(Either4::First(power))) => {
                 motor_b.set_power(power);
                 update_motor_b(&display_sender, power);
                 println!("Motor B set to {}%", power);
             }
-            Either::Second(Either::First(Either4::First(power))) => {
+            // HTTP Motor C
+            Either::First(Either::Second(Either4::Second(power))) => {
                 motor_c.set_power(power);
                 update_motor_c(&display_sender, power);
                 println!("Motor C set to {}%", power);
             }
-            Either::Second(Either::First(Either4::Second(power))) => {
+            // HTTP Motor D
+            Either::First(Either::Second(Either4::Third(power))) => {
                 motor_d.set_power(power);
                 update_motor_d(&display_sender, power);
                 println!("Motor D set to {}%", power);
             }
-            Either::Second(Either::First(Either4::Third(power))) => {
+            // Serial Motor A
+            Either::First(Either::Second(Either4::Fourth(power))) => {
                 motor_a.set_power(power);
                 update_motor_a(&display_sender, power);
                 println!("Motor A set to {}% (serial)", power);
             }
-            Either::Second(Either::First(Either4::Fourth(power))) => {
+            // Serial Motor B
+            Either::Second(Either::First(Either4::First(power))) => {
                 motor_b.set_power(power);
                 update_motor_b(&display_sender, power);
                 println!("Motor B set to {}% (serial)", power);
             }
-            Either::Second(Either::Second(Either::First(power))) => {
+            // Serial Motor C
+            Either::Second(Either::First(Either4::Second(power))) => {
                 motor_c.set_power(power);
                 update_motor_c(&display_sender, power);
                 println!("Motor C set to {}% (serial)", power);
             }
-            Either::Second(Either::Second(Either::Second(power))) => {
+            // Serial Motor D
+            Either::Second(Either::First(Either4::Third(power))) => {
                 motor_d.set_power(power);
                 update_motor_d(&display_sender, power);
                 println!("Motor D set to {}% (serial)", power);
             }
+            // BLE Motor A
+            Either::Second(Either::First(Either4::Fourth(power))) => {
+                motor_a.set_power(power);
+                update_motor_a(&display_sender, power);
+                println!("Motor A set to {}% (BLE)", power);
+            }
+            // BLE Motor B
+            Either::Second(Either::Second(Either4::First(power))) => {
+                motor_b.set_power(power);
+                update_motor_b(&display_sender, power);
+                println!("Motor B set to {}% (BLE)", power);
+            }
+            // BLE Motor C
+            Either::Second(Either::Second(Either4::Second(power))) => {
+                motor_c.set_power(power);
+                update_motor_c(&display_sender, power);
+                println!("Motor C set to {}% (BLE)", power);
+            }
+            // BLE Motor D
+            Either::Second(Either::Second(Either4::Third(power))) => {
+                motor_d.set_power(power);
+                update_motor_d(&display_sender, power);
+                println!("Motor D set to {}% (BLE)", power);
+            }
+            // Unused slot (padding for select4)
+            Either::Second(Either::Second(Either4::Fourth(_))) => {}
         }
     }
 }

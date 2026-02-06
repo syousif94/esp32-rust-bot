@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod ble;
 pub mod brushless;
 pub mod display;
 pub mod http_server;

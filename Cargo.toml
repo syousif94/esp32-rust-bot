@@ -15,7 +15,7 @@ esp-hal = { version = "1.0.0", features = ["esp32", "unstable"] }
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32"] }
 
 critical-section = "1.2.0"
-esp-radio = { version = "0.17.0", features = ["esp32", "wifi", "smoltcp", "unstable"] }
+esp-radio = { version = "0.17.0", features = ["esp32", "wifi", "smoltcp", "unstable", "ble", "coex"] }
 esp-rtos = { version = "0.2.0", features = ["embassy", "esp32", "esp-radio"] }
 embassy-net = { version = "0.7.1", features = ["tcp", "udp", "dhcpv4", "medium-ethernet"] }
 esp-println = { version = "0.16.1", features = ["esp32", "log-04"] }
@@ -32,6 +32,7 @@ embedded-io = "0.7.1"
 embedded-graphics = "0.8"
 ssd1306 = "0.9"
 heapless = "0.8"
+trouble-host = { version = "0.5.1", features = ["gatt"] }
 
 [profile.dev]
 # Rust debug is too slow.

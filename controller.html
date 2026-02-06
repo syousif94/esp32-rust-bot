@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, user-scalable=no"
+    />
+    <title>ESP32 Car Controller</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        background: #000;
+        color: #fff;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        height: 100dvh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        touch-action: none;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+
+      .status {
+        position: absolute;
+        top: 20px;
+        font-size: 12px;
+        color: #555;
+        transition: color 0.3s;
+      }
+      .status.ok {
+        color: #0f0;
+      }
+      .status.err {
+        color: #f44;
+      }
+
+      .joystick-area {
+        position: relative;
+        width: 280px;
+        height: 280px;
+      }
+
+      .ring {
+        position: absolute;
+        inset: 0;
+        border: 2px solid #333;
+        border-radius: 50%;
+      }
+
+      .ring-label {
+        position: absolute;
+        top: -24px;
+        width: 100%;
+        text-align: center;
+        font-size: 11px;
+        color: #444;
+        letter-spacing: 2px;
+        text-transform: uppercase;
+      }
+
+      .crosshair-x,
+      .crosshair-y {
+        position: absolute;
+        background: #1a1a1a;
+      }
+      .crosshair-x {
+        top: 50%;
+        left: 10%;
+        right: 10%;
+        height: 1px;
+      }
+      .crosshair-y {
+        left: 50%;
+        top: 10%;
+        bottom: 10%;
+        width: 1px;
+      }
+
+      .dot {
+        position: absolute;
+        width: 56px;
+        height: 56px;
+        border-radius: 50%;
+        background: radial-gradient(circle at 40% 38%, #2af, #07f);
+        box-shadow: 0 0 20px rgba(0, 170, 255, 0.4);
+        transform: translate(-50%, -50%);
+        top: 50%;
+        left: 50%;
+        cursor: grab;
+        z-index: 5;
+        transition: box-shadow 0.2s;
+      }
+      .dot.active {
+        box-shadow: 0 0 32px rgba(0, 170, 255, 0.7);
+        cursor: grabbing;
+      }
+
+      .telemetry {
+        position: absolute;
+        bottom: 28px;
+        display: flex;
+        gap: 40px;
+        font-size: 13px;
+      }
+
+      .motor-info {
+        text-align: center;
+      }
+      .motor-info .label {
+        color: #555;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        margin-bottom: 4px;
+      }
+      .motor-info .value {
+        font-size: 28px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        min-width: 60px;
+        display: inline-block;
+      }
+      .motor-info .value.pos {
+        color: #0f0;
+      }
+      .motor-info .value.neg {
+        color: #f44;
+      }
+      .motor-info .value.zero {
+        color: #444;
+      }
+
+      .motor-detail {
+        font-size: 11px;
+        color: #555;
+        margin-top: 2px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="status" id="status">Connected</div>
+
+    <div class="joystick-area" id="joystick">
+      <div class="ring">
+        <span class="ring-label">100%</span>
+      </div>
+      <div class="crosshair-x"></div>
+      <div class="crosshair-y"></div>
+      <div class="dot" id="dot"></div>
+    </div>
+
+    <div class="telemetry">
+      <div class="motor-info">
+        <div class="label">Left</div>
+        <div class="value zero" id="left-val">0</div>
+        <div class="motor-detail">A &amp; C</div>
+      </div>
+      <div class="motor-info">
+        <div class="label">Right</div>
+        <div class="value zero" id="right-val">0</div>
+        <div class="motor-detail">B &amp; D</div>
+      </div>
+    </div>
+
+    <script>
+      const dot = document.getElementById('dot');
+      const joystick = document.getElementById('joystick');
+      const statusEl = document.getElementById('status');
+      const leftVal = document.getElementById('left-val');
+      const rightVal = document.getElementById('right-val');
+
+      const baseUrl = `http://${window.location.host}`;
+
+      const radius = 140; // half of joystick-area width
+      let dragging = false;
+      let currentLeft = 0;
+      let currentRight = 0;
+      let sending = false;
+      let needsSend = false;
+      let lastSentLeft = null;
+      let lastSentRight = null;
+
+      function getCenter() {
+        const rect = joystick.getBoundingClientRect();
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      }
+
+      function clamp(v, min, max) {
+        return Math.max(min, Math.min(max, v));
+      }
+
+      function updateDot(clientX, clientY) {
+        const c = getCenter();
+        let dx = clientX - c.x;
+        let dy = clientY - c.y;
+
+        // Clamp to circle
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist > radius) {
+          dx = (dx / dist) * radius;
+          dy = (dy / dist) * radius;
+        }
+
+        dot.style.left = `calc(50% + ${dx}px)`;
+        dot.style.top = `calc(50% + ${dy}px)`;
+
+        // Normalize to -1..1 (y inverted: up = positive)
+        const nx = dx / radius;
+        const ny = -dy / radius;
+
+        // Tank drive mixing
+        let left = clamp(Math.round((ny + nx) * 100), -100, 100);
+        let right = clamp(Math.round((ny - nx) * 100), -100, 100);
+
+        currentLeft = left;
+        currentRight = right;
+
+        updateDisplay(left, right);
+        scheduleSend();
+      }
+
+      function resetDot() {
+        dot.style.left = '50%';
+        dot.style.top = '50%';
+        currentLeft = 0;
+        currentRight = 0;
+        updateDisplay(0, 0);
+        sendMotorValues(0, 0);
+      }
+
+      function updateDisplay(left, right) {
+        leftVal.textContent = left;
+        rightVal.textContent = right;
+        leftVal.className =
+          'value ' + (left > 0 ? 'pos' : left < 0 ? 'neg' : 'zero');
+        rightVal.className =
+          'value ' + (right > 0 ? 'pos' : right < 0 ? 'neg' : 'zero');
+      }
+
+      // Sequential sending — waits for response, then sends latest position
+      function scheduleSend() {
+        if (currentLeft === lastSentLeft && currentRight === lastSentRight)
+          return;
+        if (sending) {
+          needsSend = true;
+          return;
+        }
+        sendMotorValues(currentLeft, currentRight);
+      }
+
+      async function sendMotorValues(left, right) {
+        sending = true;
+        needsSend = false;
+
+        try {
+          await fetch(
+            `${baseUrl}/motors?a=${left}&b=${right}&c=${left}&d=${right}`,
+          );
+          lastSentLeft = left;
+          lastSentRight = right;
+          statusEl.textContent = `Connected — L:${left} R:${right}`;
+          statusEl.className = 'status ok';
+        } catch (e) {
+          statusEl.textContent = 'Connection error';
+          statusEl.className = 'status err';
+        }
+
+        sending = false;
+        // If joystick moved during the fetch, send the latest values if changed
+        if (
+          needsSend &&
+          (currentLeft !== lastSentLeft || currentRight !== lastSentRight)
+        ) {
+          sendMotorValues(currentLeft, currentRight);
+        }
+      }
+
+      // Pointer events (mouse + touch unified)
+      function onStart(e) {
+        e.preventDefault();
+        dragging = true;
+        dot.classList.add('active');
+        const pt = e.touches ? e.touches[0] : e;
+        updateDot(pt.clientX, pt.clientY);
+      }
+
+      function onMove(e) {
+        if (!dragging) return;
+        e.preventDefault();
+        const pt = e.touches ? e.touches[0] : e;
+        updateDot(pt.clientX, pt.clientY);
+      }
+
+      function onEnd(e) {
+        if (!dragging) return;
+        dragging = false;
+        dot.classList.remove('active');
+        resetDot();
+      }
+
+      // Attach to joystick area so tapping anywhere in the ring works
+      joystick.addEventListener('mousedown', onStart);
+      joystick.addEventListener('touchstart', onStart, { passive: false });
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('touchmove', onMove, { passive: false });
+      window.addEventListener('mouseup', onEnd);
+      window.addEventListener('touchend', onEnd);
+      window.addEventListener('touchcancel', onEnd);
+
+      // Keyboard fallback — arrow keys
+      const keys = {};
+      window.addEventListener('keydown', (e) => {
+        if (
+          ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)
+        ) {
+          e.preventDefault();
+          keys[e.key] = true;
+          updateFromKeys();
+        }
+      });
+      window.addEventListener('keyup', (e) => {
+        if (
+          ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)
+        ) {
+          keys[e.key] = false;
+          updateFromKeys();
+        }
+      });
+
+      function updateFromKeys() {
+        let y = 0,
+          x = 0;
+        if (keys['ArrowUp']) y += 1;
+        if (keys['ArrowDown']) y -= 1;
+        if (keys['ArrowRight']) x += 1;
+        if (keys['ArrowLeft']) x -= 1;
+
+        const left = clamp(Math.round((y + x) * 100), -100, 100);
+        const right = clamp(Math.round((y - x) * 100), -100, 100);
+        currentLeft = left;
+        currentRight = right;
+
+        // Move dot visually
+        dot.style.left = `calc(50% + ${x * radius}px)`;
+        dot.style.top = `calc(50% + ${-y * radius}px)`;
+
+        updateDisplay(left, right);
+        scheduleSend();
+      }
+    </script>
+  </body>
+</html>

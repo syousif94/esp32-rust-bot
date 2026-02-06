@@ -7,7 +7,10 @@ use embassy_sync::signal::Signal;
 
 /// Buffer sizes for HTTP server
 const RX_BUFFER_SIZE: usize = 1024;
-const TX_BUFFER_SIZE: usize = 1024;
+const TX_BUFFER_SIZE: usize = 4096;
+
+/// The controller HTML page, included at compile time
+const CONTROLLER_HTML: &str = include_str!("../controller.html");
 
 /// Signal for servo angle updates
 pub static SERVO_ANGLE: Signal<CriticalSectionRawMutex, u8> = Signal::new();
@@ -27,7 +30,7 @@ pub static MOTOR_D_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
 /// Simple HTTP response builder
 fn build_response(status: &str, content_type: &str, body: &str) -> alloc::string::String {
     alloc::format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
         status,
         content_type,
         body.len(),
@@ -99,10 +102,57 @@ fn parse_motor_power(path: &str) -> Option<(char, i8)> {
     None
 }
 
+/// Parse batch motor powers from query string like /motors?a=50&b=-30&c=50&d=-30
+/// Returns (Option<i8>, Option<i8>, Option<i8>, Option<i8>) for motors A, B, C, D
+fn parse_motors_batch(path: &str) -> Option<(Option<i8>, Option<i8>, Option<i8>, Option<i8>)> {
+    let query = path.split('?').nth(1)?;
+    let mut a: Option<i8> = None;
+    let mut b: Option<i8> = None;
+    let mut c: Option<i8> = None;
+    let mut d: Option<i8> = None;
+    let mut found_any = false;
+    for part in query.split('&') {
+        if let Some(val) = part.strip_prefix("a=") {
+            if let Ok(p) = val.parse::<i8>() {
+                if p >= -100 && p <= 100 { a = Some(p); found_any = true; }
+            }
+        } else if let Some(val) = part.strip_prefix("b=") {
+            if let Ok(p) = val.parse::<i8>() {
+                if p >= -100 && p <= 100 { b = Some(p); found_any = true; }
+            }
+        } else if let Some(val) = part.strip_prefix("c=") {
+            if let Ok(p) = val.parse::<i8>() {
+                if p >= -100 && p <= 100 { c = Some(p); found_any = true; }
+            }
+        } else if let Some(val) = part.strip_prefix("d=") {
+            if let Ok(p) = val.parse::<i8>() {
+                if p >= -100 && p <= 100 { d = Some(p); found_any = true; }
+            }
+        }
+    }
+    if found_any { Some((a, b, c, d)) } else { None }
+}
+
+/// Response type to avoid allocating the large HTML page on heap
+enum HttpResponse {
+    /// Small JSON/text response (heap allocated, fine for small bodies)
+    Small(alloc::string::String),
+    /// Serve the static HTML page - only headers are allocated, body streamed from flash
+    StaticHtml,
+}
+
+/// Build just the HTTP headers for the static HTML page
+fn build_html_headers() -> alloc::string::String {
+    alloc::format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+        CONTROLLER_HTML.len()
+    )
+}
+
 /// Handle an incoming HTTP request and return a response
-fn handle_request(request: &str) -> alloc::string::String {
+fn handle_request(request: &str) -> HttpResponse {
     let Some((method, path)) = parse_request(request) else {
-        return build_response("400 Bad Request", "text/plain", "Bad Request");
+        return HttpResponse::Small(build_response("400 Bad Request", "text/plain", "Bad Request"));
     };
 
     println!("HTTP {} {}", method, path);
@@ -110,11 +160,30 @@ fn handle_request(request: &str) -> alloc::string::String {
     match method {
         "GET" => {
             if path == "/" {
-                let body = r#"{"status": "ok", "message": "ESP32 Motor & Servo Controller", "endpoints": ["/servo/<angle>", "/servo?angle=<0-180>", "/motor/a/<power>", "/motor/b/<power>", "/motor/c/<power>", "/motor/d/<power>", "/motor/<a|b|c|d>?power=<-100 to 100>"]}"#;
-                build_response("200 OK", "application/json", body)
+                return HttpResponse::StaticHtml;
+            } else if path == "/favicon.ico" {
+                HttpResponse::Small("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".into())
             } else if path == "/health" {
                 let body = r#"{"healthy": true}"#;
-                build_response("200 OK", "application/json", body)
+                HttpResponse::Small(build_response("200 OK", "application/json", body))
+            } else if path.starts_with("/motors?") {
+                if let Some((a, b, c, d)) = parse_motors_batch(path) {
+                    if let Some(p) = a { MOTOR_A_POWER.signal(p); }
+                    if let Some(p) = b { MOTOR_B_POWER.signal(p); }
+                    if let Some(p) = c { MOTOR_C_POWER.signal(p); }
+                    if let Some(p) = d { MOTOR_D_POWER.signal(p); }
+                    let body = alloc::format!(
+                        r#"{{"a":{},"b":{},"c":{},"d":{}}}"#,
+                        a.map_or("null".into(), |v| alloc::format!("{}", v)),
+                        b.map_or("null".into(), |v| alloc::format!("{}", v)),
+                        c.map_or("null".into(), |v| alloc::format!("{}", v)),
+                        d.map_or("null".into(), |v| alloc::format!("{}", v)),
+                    );
+                    HttpResponse::Small(build_response("200 OK", "application/json", &body))
+                } else {
+                    let body = r#"{"error": "Provide at least one motor param: /motors?a=50&b=-30"}"#;
+                    HttpResponse::Small(build_response("400 Bad Request", "application/json", body))
+                }
             } else if path.starts_with("/motor/") {
                 if let Some((motor_id, power)) = parse_motor_power(path) {
                     if power >= -100 && power <= 100 {
@@ -126,37 +195,37 @@ fn handle_request(request: &str) -> alloc::string::String {
                             _ => unreachable!(),
                         }
                         let body = alloc::format!(r#"{{"motor": "{}", "power": {}}}"#, motor_id, power);
-                        build_response("200 OK", "application/json", &body)
+                        HttpResponse::Small(build_response("200 OK", "application/json", &body))
                     } else {
                         let body = r#"{"error": "Power must be between -100 and 100"}"#;
-                        build_response("400 Bad Request", "application/json", body)
+                        HttpResponse::Small(build_response("400 Bad Request", "application/json", body))
                     }
                 } else {
                     let body = r#"{"error": "Missing or invalid power parameter. Use /motor/a/50 or /motor/a?power=50"}"#;
-                    build_response("400 Bad Request", "application/json", body)
+                    HttpResponse::Small(build_response("400 Bad Request", "application/json", body))
                 }
             } else if path.starts_with("/servo") {
                 if let Some(angle) = parse_servo_angle(path) {
                     if angle <= 180 {
                         SERVO_ANGLE.signal(angle);
                         let body = alloc::format!(r#"{{"angle": {}}}"#, angle);
-                        build_response("200 OK", "application/json", &body)
+                        HttpResponse::Small(build_response("200 OK", "application/json", &body))
                     } else {
                         let body = r#"{"error": "Angle must be between 0 and 180"}"#;
-                        build_response("400 Bad Request", "application/json", body)
+                        HttpResponse::Small(build_response("400 Bad Request", "application/json", body))
                     }
                 } else {
                     let body = r#"{"error": "Missing or invalid angle parameter. Use /servo/90 or /servo?angle=90"}"#;
-                    build_response("400 Bad Request", "application/json", body)
+                    HttpResponse::Small(build_response("400 Bad Request", "application/json", body))
                 }
             } else {
                 let body = r#"{"error": "Not Found"}"#;
-                build_response("404 Not Found", "application/json", body)
+                HttpResponse::Small(build_response("404 Not Found", "application/json", body))
             }
         }
         _ => {
             let body = r#"{"error": "Method Not Allowed"}"#;
-            build_response("405 Method Not Allowed", "application/json", body)
+            HttpResponse::Small(build_response("405 Method Not Allowed", "application/json", body))
         }
     }
 }
@@ -187,15 +256,45 @@ pub async fn http_server_task(stack: Stack<'static>) {
             }
             Ok(n) => {
                 if let Ok(request) = core::str::from_utf8(&buf[..n]) {
-                    let response = handle_request(request);
-                    let mut offset = 0;
-                    let bytes = response.as_bytes();
-                    while offset < bytes.len() {
-                        match socket.write(&bytes[offset..]).await {
-                            Ok(written) => offset += written,
-                            Err(e) => {
-                                println!("Write error: {:?}", e);
-                                break;
+                    match handle_request(request) {
+                        HttpResponse::Small(response) => {
+                            let mut offset = 0;
+                            let bytes = response.as_bytes();
+                            while offset < bytes.len() {
+                                match socket.write(&bytes[offset..]).await {
+                                    Ok(written) => offset += written,
+                                    Err(e) => {
+                                        println!("Write error: {:?}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        HttpResponse::StaticHtml => {
+                            // Write headers (small heap alloc, ~150 bytes)
+                            let headers = build_html_headers();
+                            let mut offset = 0;
+                            let bytes = headers.as_bytes();
+                            while offset < bytes.len() {
+                                match socket.write(&bytes[offset..]).await {
+                                    Ok(written) => offset += written,
+                                    Err(e) => {
+                                        println!("Write error: {:?}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                            // Stream HTML body directly from flash, no heap alloc
+                            let mut offset = 0;
+                            let bytes = CONTROLLER_HTML.as_bytes();
+                            while offset < bytes.len() {
+                                match socket.write(&bytes[offset..]).await {
+                                    Ok(written) => offset += written,
+                                    Err(e) => {
+                                        println!("Write error: {:?}", e);
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -206,8 +305,7 @@ pub async fn http_server_task(stack: Stack<'static>) {
             }
         }
 
+        socket.flush().await.ok();
         socket.close();
-        // Small delay before accepting next connection
-        embassy_time::Timer::after(Duration::from_millis(100)).await;
     }
 }
