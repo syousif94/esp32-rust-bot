@@ -7,6 +7,7 @@ use embassy_executor::Spawner;
 use embassy_net::{Runner, StackResources};
 use embassy_time::{Duration, Timer};
 use embassy_futures::select::{select, select4, Either, Either4};
+use core::pin::pin;
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::{
@@ -30,7 +31,7 @@ use esp_radio::wifi::{
 };
 use static_cell::StaticCell;
 use esp32_http_servo::brushless::{BrushlessMotor, init_motor_timer};
-use esp32_http_servo::display::{display_task, init_display_state, update_motor_a, update_motor_b, update_motor_c, update_motor_d, update_ip, DisplaySender};
+use esp32_http_servo::display::{display_task, init_display_state, update_motor_a, update_motor_b, update_motor_c, update_motor_d, update_ip, update_dots, update_status, WifiStatus, DisplaySender};
 use esp32_http_servo::http_server::{http_server_task, SERVO_ANGLE, MOTOR_A_POWER, MOTOR_B_POWER, MOTOR_C_POWER, MOTOR_D_POWER};
 use esp32_http_servo::serial_cmd::{serial_input_task, SERIAL_SERVO_ANGLE, SERIAL_MOTOR_A_POWER, SERIAL_MOTOR_B_POWER, SERIAL_MOTOR_C_POWER, SERIAL_MOTOR_D_POWER};
 use esp32_http_servo::servo::{ServoController, init_servo_timer};
@@ -132,13 +133,13 @@ async fn main(spawner: Spawner) -> ! {
     );
     println!("Motor D initialized on GPIO22/GPIO23");
 
-    // Initialize I2C for OLED display (GPIO4 = SDA, GPIO5 = SCL)
+    // Initialize I2C for OLED display (GPIO5 = SDA, GPIO4 = SCL)
     let i2c_config = I2cConfig::default().with_frequency(Rate::from_khz(100));
     let i2c = I2c::new(peripherals.I2C0, i2c_config)
         .unwrap()
         .with_sda(peripherals.GPIO4)
         .with_scl(peripherals.GPIO5);
-    println!("I2C initialized on GPIO4 (SDA) / GPIO5 (SCL) at 100kHz");
+    println!("I2C initialized on GPIO5 (SDA) / GPIO4 (SCL) at 100kHz");
 
     // Initialize display state and spawn display task
     let display_sender = init_display_state();
@@ -174,7 +175,7 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     // Spawn background tasks
-    spawner.spawn(connection(controller)).ok();
+    spawner.spawn(connection(controller, display_sender.clone())).ok();
     spawner.spawn(net_task(runner)).ok();
     spawner.spawn(wifi_ready_task(spawner, stack, display_sender.clone())).ok();
 
@@ -262,14 +263,25 @@ async fn wifi_ready_task(
     display_sender: DisplaySender,
 ) {
     // Wait for link to be up
+    let mut period_count: u8 = 0;
     loop {
         if stack.is_link_up() {
             break;
         }
-        Timer::after(Duration::from_millis(500)).await;
+        period_count = (period_count + 1) % 4;
+        update_dots(&display_sender, period_count);
+        match period_count {
+            0 => println!("Waiting for link"),
+            1 => println!("Waiting for link."),
+            2 => println!("Waiting for link.."),
+            _ => println!("Waiting for link..."),
+        }
+        Timer::after(Duration::from_millis(1000)).await;
     }
 
     println!("Waiting to get IP address...");
+    update_status(&display_sender, WifiStatus::GettingIP);
+    period_count = 0;
     loop {
         if let Some(config) = stack.config_v4() {
             println!("Got IP: {}", config.address);
@@ -278,7 +290,15 @@ async fn wifi_ready_task(
             update_ip(&display_sender, ip.octets());
             break;
         }
-        Timer::after(Duration::from_millis(500)).await;
+        period_count = (period_count + 1) % 4;
+        update_dots(&display_sender, period_count);
+        match period_count {
+            0 => println!("Getting IP"),
+            1 => println!("Getting IP."),
+            2 => println!("Getting IP.."),
+            _ => println!("Getting IP..."),
+        }
+        Timer::after(Duration::from_millis(1000)).await;
     }
 
     println!("WiFi connected successfully!");
@@ -288,7 +308,7 @@ async fn wifi_ready_task(
 }
 
 #[embassy_executor::task]
-async fn connection(mut controller: WifiController<'static>) {
+async fn connection(mut controller: WifiController<'static>, display_sender: DisplaySender) {
     println!("Start connection task");
     println!("Device capabilities: {:?}", controller.capabilities());
     
@@ -318,7 +338,30 @@ async fn connection(mut controller: WifiController<'static>) {
         
         println!("Connecting to WiFi network: {}", SSID);
         
-        match controller.connect_async().await {
+        // Animate "Connecting" message with 0-3 periods while waiting
+        let mut connect_future = pin!(controller.connect_async());
+        let mut period_count: u8 = 0;
+        
+        let result = loop {
+            match select(
+                &mut connect_future,
+                Timer::after(Duration::from_millis(1000)),
+            ).await {
+                Either::First(result) => break result,
+                Either::Second(_) => {
+                    period_count = (period_count + 1) % 4;
+                    update_dots(&display_sender, period_count);
+                    match period_count {
+                        0 => println!("Connecting"),
+                        1 => println!("Connecting."),
+                        2 => println!("Connecting.."),
+                        _ => println!("Connecting..."),
+                    }
+                }
+            }
+        };
+        
+        match result {
             Ok(_) => println!("WiFi connected!"),
             Err(e) => {
                 println!("Failed to connect to WiFi: {:?}", e);

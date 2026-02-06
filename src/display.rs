@@ -30,6 +30,15 @@ pub type DisplaySender = Sender<'static, CriticalSectionRawMutex, DisplayState, 
 /// Watch for sharing display state across tasks
 pub static DISPLAY_STATE: Watch<CriticalSectionRawMutex, DisplayState, WATCH_RECEIVERS> = Watch::new();
 
+/// WiFi connection status for display
+#[derive(Clone, Copy, Default)]
+pub enum WifiStatus {
+    #[default]
+    Connecting,
+    GettingIP,
+    Connected,
+}
+
 /// Display state containing motor powers and IP address
 #[derive(Clone, Copy, Default)]
 pub struct DisplayState {
@@ -38,7 +47,8 @@ pub struct DisplayState {
     pub motor_c: i8,
     pub motor_d: i8,
     pub ip: [u8; 4],
-    pub connected: bool,
+    pub status: WifiStatus,
+    pub dots: u8,
 }
 
 /// Initialize the display state sender
@@ -90,7 +100,25 @@ pub fn update_ip(sender: &DisplaySender, ip: [u8; 4]) {
     sender.send_modify(|state| {
         if let Some(s) = state {
             s.ip = ip;
-            s.connected = true;
+            s.status = WifiStatus::Connected;
+        }
+    });
+}
+
+/// Update the WiFi status in display state
+pub fn update_status(sender: &DisplaySender, status: WifiStatus) {
+    sender.send_modify(|state| {
+        if let Some(s) = state {
+            s.status = status;
+        }
+    });
+}
+
+/// Update the animated dots count (0-3) in display state
+pub fn update_dots(sender: &DisplaySender, dots: u8) {
+    sender.send_modify(|state| {
+        if let Some(s) = state {
+            s.dots = dots;
         }
     });
 }
@@ -152,11 +180,25 @@ pub async fn display_task(i2c: I2c<'static, Blocking>, ssid: &'static str) {
         
         // Line 2: IP Address
         line_buf.clear();
-        if state.connected {
-            let _ = write!(line_buf, "IP: {}.{}.{}.{}", 
-                state.ip[0], state.ip[1], state.ip[2], state.ip[3]);
-        } else {
-            let _ = write!(line_buf, "IP: Connecting...");
+        match state.status {
+            WifiStatus::Connected => {
+                let _ = write!(line_buf, "IP: {}.{}.{}.{}", 
+                    state.ip[0], state.ip[1], state.ip[2], state.ip[3]);
+            }
+            _ => {
+                let dots = match state.dots % 4 {
+                    1 => ".",
+                    2 => "..",
+                    3 => "...",
+                    _ => "",
+                };
+                let label = match state.status {
+                    WifiStatus::Connecting => "Connecting",
+                    WifiStatus::GettingIP => "Getting IP",
+                    _ => unreachable!(),
+                };
+                let _ = write!(line_buf, "{}{}", label, dots);
+            }
         }
         let _ = Text::new(&line_buf, Point::new(0, 24), text_style).draw(&mut display);
         
