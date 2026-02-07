@@ -200,6 +200,9 @@ The ESP32 advertises as a BLE peripheral named **"ESP32 Motor"**. It exposes a s
 | Advertising Type | Connectable, Scannable, Undirected |
 | Discoverable     | LE General Discoverable            |
 | BR/EDR           | Not supported (BLE only)           |
+| Scan Response    | 128-bit service UUID               |
+
+CoreBluetooth and Android can discover the device by scanning for the service UUID directly.
 
 ### Service
 
@@ -209,26 +212,34 @@ The ESP32 advertises as a BLE peripheral named **"ESP32 Motor"**. It exposes a s
 
 ### Characteristics
 
-All characteristics support **Read**, **Write**, and **Notify**.
+Both characteristics support **Read**, **Write**, and **Notify**.
 
-| Name        | UUID                                   | Type | Range    | Default | Description               |
-| ----------- | -------------------------------------- | ---- | -------- | ------- | ------------------------- |
-| Servo Angle | `E3910002-4567-4321-ABCD-ABCDEF012345` | u8   | 0–180    | 90      | Servo position in degrees |
-| Motor A     | `E3910003-4567-4321-ABCD-ABCDEF012345` | i8   | -100–100 | 0       | Motor A power (signed)    |
-| Motor B     | `E3910004-4567-4321-ABCD-ABCDEF012345` | i8   | -100–100 | 0       | Motor B power (signed)    |
-| Motor C     | `E3910005-4567-4321-ABCD-ABCDEF012345` | i8   | -100–100 | 0       | Motor C power (signed)    |
-| Motor D     | `E3910006-4567-4321-ABCD-ABCDEF012345` | i8   | -100–100 | 0       | Motor D power (signed)    |
+| Name        | UUID                                   | Type      | Length  | Range         | Default        | Description                        |
+| ----------- | -------------------------------------- | --------- | ------- | ------------- | -------------- | ---------------------------------- |
+| Servo Angle | `E3910002-4567-4321-ABCD-ABCDEF012345` | u8        | 1 byte  | 0–180         | 90             | Servo position in degrees          |
+| Motors      | `E3910003-4567-4321-ABCD-ABCDEF012345` | `[i8; 4]` | 4 bytes | -100–100 each | `[0, 0, 0, 0]` | Motor A, B, C, D powers (in order) |
+
+#### Motors Byte Layout
+
+| Byte | Motor | Type | Range    |
+| ---- | ----- | ---- | -------- |
+| 0    | A     | i8   | -100–100 |
+| 1    | B     | i8   | -100–100 |
+| 2    | C     | i8   | -100–100 |
+| 3    | D     | i8   | -100–100 |
+
+Writes with fewer than 4 bytes are ignored. All four motor powers are updated atomically in a single BLE write.
 
 ### Data Format
 
-Each characteristic holds a single byte:
-
-- **Servo Angle**: unsigned byte (`0x00`–`0xB4`). Values above 180 are ignored.
-- **Motor Power**: signed byte (`0x9C`–`0x64`, i.e. -100 to +100). Negative values = reverse. Values outside the range are ignored.
+- **Servo Angle**: unsigned byte (`0x00`–`0xB4`). Values above 180 are rejected.
+- **Motors**: 4 signed bytes `[A, B, C, D]`. Each byte is an i8 in the range -100 to +100. Negative values = reverse. Writes with fewer than 4 bytes are rejected.
 
 ### Write Behavior
 
-Writing a value to a characteristic immediately applies it. Out-of-range values are silently ignored (the write succeeds at the GATT level but the motor/servo state does not change).
+Writing a value to a characteristic immediately applies it. Out-of-range or malformed values are rejected — the write succeeds at the GATT level but the motor/servo state does not change, and a diagnostic message is printed to the serial log.
+
+All write events are logged to the serial console with the handle, raw data bytes, and length for debugging.
 
 ### Read Behavior
 
@@ -242,18 +253,15 @@ Reading a characteristic returns the last value set by any interface (BLE, HTTP,
 import CoreBluetooth
 
 // UUIDs
-let serviceUUID        = CBUUID(string: "E3910001-4567-4321-ABCD-ABCDEF012345")
-let servoAngleUUID     = CBUUID(string: "E3910002-4567-4321-ABCD-ABCDEF012345")
-let motorAUUID         = CBUUID(string: "E3910003-4567-4321-ABCD-ABCDEF012345")
-let motorBUUID         = CBUUID(string: "E3910004-4567-4321-ABCD-ABCDEF012345")
-let motorCUUID         = CBUUID(string: "E3910005-4567-4321-ABCD-ABCDEF012345")
-let motorDUUID         = CBUUID(string: "E3910006-4567-4321-ABCD-ABCDEF012345")
+let serviceUUID    = CBUUID(string: "E3910001-4567-4321-ABCD-ABCDEF012345")
+let servoAngleUUID = CBUUID(string: "E3910002-4567-4321-ABCD-ABCDEF012345")
+let motorsUUID     = CBUUID(string: "E3910003-4567-4321-ABCD-ABCDEF012345")
 
 class MotorController: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var centralManager: CBCentralManager!
     var peripheral: CBPeripheral?
     var servoChar: CBCharacteristic?
-    var motorAChar: CBCharacteristic?
+    var motorsChar: CBCharacteristic?
 
     override init() {
         super.init()
@@ -300,7 +308,7 @@ class MotorController: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate 
         for char in service.characteristics ?? [] {
             switch char.uuid {
             case servoAngleUUID: servoChar = char
-            case motorAUUID:     motorAChar = char
+            case motorsUUID:     motorsChar = char
             default: break
             }
             // Enable notifications
@@ -318,23 +326,33 @@ class MotorController: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate 
         p.writeValue(Data([angle]), for: char, type: .withResponse)
     }
 
-    /// Set motor power (-100 to 100)
-    func setMotorAPower(_ power: Int8) {
-        guard let char = motorAChar, let p = peripheral else { return }
-        p.writeValue(Data([UInt8(bitPattern: power)]), for: char, type: .withResponse)
+    /// Set all motors at once (4 bytes: A, B, C, D)
+    func setMotors(a: Int8, b: Int8, c: Int8, d: Int8) {
+        guard let char = motorsChar, let p = peripheral else { return }
+        let data = Data([
+            UInt8(bitPattern: a),
+            UInt8(bitPattern: b),
+            UInt8(bitPattern: c),
+            UInt8(bitPattern: d)
+        ])
+        p.writeValue(data, for: char, type: .withResponse)
     }
 
     // Handle notifications
     func peripheral(_ peripheral: CBPeripheral,
                     didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
-        guard let data = characteristic.value, let byte = data.first else { return }
+        guard let data = characteristic.value else { return }
         switch characteristic.uuid {
         case servoAngleUUID:
-            print("Servo angle: \(byte)")
-        case motorAUUID:
-            let power = Int8(bitPattern: byte)
-            print("Motor A power: \(power)")
+            if let byte = data.first {
+                print("Servo angle: \(byte)")
+            }
+        case motorsUUID:
+            if data.count >= 4 {
+                let powers = data.prefix(4).map { Int8(bitPattern: $0) }
+                print("Motors: A=\(powers[0]) B=\(powers[1]) C=\(powers[2]) D=\(powers[3])")
+            }
         default: break
         }
     }
@@ -350,7 +368,7 @@ import java.util.UUID
 
 val SERVICE_UUID     = UUID.fromString("E3910001-4567-4321-ABCD-ABCDEF012345")
 val SERVO_ANGLE_UUID = UUID.fromString("E3910002-4567-4321-ABCD-ABCDEF012345")
-val MOTOR_A_UUID     = UUID.fromString("E3910003-4567-4321-ABCD-ABCDEF012345")
+val MOTORS_UUID      = UUID.fromString("E3910003-4567-4321-ABCD-ABCDEF012345")
 
 // Scan for the ESP32
 val scanner = bluetoothAdapter.bluetoothLeScanner
@@ -374,16 +392,21 @@ val gattCallback = object : BluetoothGattCallback() {
 
     override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
         val service = gatt.getService(SERVICE_UUID)
-        val servoChar = service.getCharacteristic(SERVO_ANGLE_UUID)
 
         // Write servo angle
+        val servoChar = service.getCharacteristic(SERVO_ANGLE_UUID)
         servoChar.value = byteArrayOf(90.toByte())
         gatt.writeCharacteristic(servoChar)
 
-        // Write motor power (signed byte)
-        val motorChar = service.getCharacteristic(MOTOR_A_UUID)
-        motorChar.value = byteArrayOf(75.toByte()) // forward 75%
-        gatt.writeCharacteristic(motorChar)
+        // Write all motors at once
+        val motorsChar = service.getCharacteristic(MOTORS_UUID)
+        motorsChar.value = byteArrayOf(
+            75.toByte(),    // Motor A: forward 75%
+            75.toByte(),    // Motor B: forward 75%
+            (-50).toByte(), // Motor C: reverse 50%
+            (-50).toByte()  // Motor D: reverse 50%
+        )
+        gatt.writeCharacteristic(motorsChar)
     }
 }
 ```
@@ -397,4 +420,4 @@ val gattCallback = object : BluetoothGattCallback() {
 | Servo Angle | u8   | 0    | 180 | degrees | Unsigned byte      |
 | Motor Power | i8   | -100 | 100 | percent | Negative = reverse |
 
-Both interfaces enforce the same validation. Out-of-range values return a `400` error over HTTP and are silently ignored over BLE.
+Both interfaces enforce the same validation. Out-of-range values return a `400` error over HTTP and are rejected (with a serial log message) over BLE.

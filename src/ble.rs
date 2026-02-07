@@ -21,27 +21,15 @@ const L2CAP_CHANNELS_MAX: usize = 2;
 /// Signal for servo angle updates from BLE
 pub static BLE_SERVO_ANGLE: Signal<CriticalSectionRawMutex, u8> = Signal::new();
 
-/// Signal for motor A power updates from BLE (-100 to +100)
-pub static BLE_MOTOR_A_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
-
-/// Signal for motor B power updates from BLE (-100 to +100)
-pub static BLE_MOTOR_B_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
-
-/// Signal for motor C power updates from BLE (-100 to +100)
-pub static BLE_MOTOR_C_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
-
-/// Signal for motor D power updates from BLE (-100 to +100)
-pub static BLE_MOTOR_D_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
+/// Signal for all motors at once from BLE (a, b, c, d) — each -100 to +100
+pub static BLE_MOTORS_ALL: Signal<CriticalSectionRawMutex, [i8; 4]> = Signal::new();
 
 // Custom 128-bit UUIDs for our service and characteristics.
 // These are random UUIDs — the Swift app will scan for the service UUID.
 //
-// Service:  e3910001-4567-4321-abcd-abcdef012345
-// Servo:    e3910002-4567-4321-abcd-abcdef012345
-// Motor A:  e3910003-4567-4321-abcd-abcdef012345
-// Motor B:  e3910004-4567-4321-abcd-abcdef012345
-// Motor C:  e3910005-4567-4321-abcd-abcdef012345
-// Motor D:  e3910006-4567-4321-abcd-abcdef012345
+// Service:     e3910001-4567-4321-abcd-abcdef012345
+// Servo:       e3910002-4567-4321-abcd-abcdef012345
+// Motors (4B): e3910003-4567-4321-abcd-abcdef012345
 
 /// GATT Server definition with our motor control service
 #[gatt_server]
@@ -53,24 +41,12 @@ struct Server {
 #[gatt_service(uuid = "e3910001-4567-4321-abcd-abcdef012345")]
 struct MotorControlService {
     /// Servo angle (0-180), read + write + notify
-    #[characteristic(uuid = "e3910002-4567-4321-abcd-abcdef012345", read, write, notify, value = 90)]
+    #[characteristic(uuid = "e3910002-4567-4321-abcd-abcdef012345", read, write, write_without_response, notify, value = 90)]
     servo_angle: u8,
 
-    /// Motor A power (-100 to 100), read + write + notify
-    #[characteristic(uuid = "e3910003-4567-4321-abcd-abcdef012345", read, write, notify, value = 0)]
-    motor_a: i8,
-
-    /// Motor B power (-100 to 100), read + write + notify
-    #[characteristic(uuid = "e3910004-4567-4321-abcd-abcdef012345", read, write, notify, value = 0)]
-    motor_b: i8,
-
-    /// Motor C power (-100 to 100), read + write + notify
-    #[characteristic(uuid = "e3910005-4567-4321-abcd-abcdef012345", read, write, notify, value = 0)]
-    motor_c: i8,
-
-    /// Motor D power (-100 to 100), read + write + notify
-    #[characteristic(uuid = "e3910006-4567-4321-abcd-abcdef012345", read, write, notify, value = 0)]
-    motor_d: i8,
+    /// All motors (4 bytes: A, B, C, D each -100..100), read + write + write_without_response + notify
+    #[characteristic(uuid = "e3910003-4567-4321-abcd-abcdef012345", read, write, write_without_response, notify, value = [0, 0, 0, 0])]
+    motors: [u8; 4],
 }
 
 /// Run the BLE host stack background task
@@ -92,52 +68,44 @@ async fn gatt_events_task<P: PacketPool>(
                         let handle = write_event.handle();
                         let data = write_event.data();
 
+                        println!("[BLE] Write event: handle={:?}, data={:?} ({} bytes)", handle, data, data.len());
+
                         // Check which characteristic was written and signal accordingly
                         if handle == server.motor_control.servo_angle.handle {
                             if let Some(&val) = data.first() {
                                 if val <= 180 {
                                     println!("[BLE] Servo angle set to {}", val);
                                     BLE_SERVO_ANGLE.signal(val);
+                                } else {
+                                    println!("[BLE] Servo angle {} out of range (0-180)", val);
                                 }
                             }
-                        } else if handle == server.motor_control.motor_a.handle {
-                            if let Some(&val) = data.first() {
-                                let power = val as i8;
-                                if power >= -100 && power <= 100 {
-                                    println!("[BLE] Motor A set to {}%", power);
-                                    BLE_MOTOR_A_POWER.signal(power);
-                                }
+                        } else if handle == server.motor_control.motors.handle {
+                            if data.len() >= 4 {
+                                let a = data[0] as i8;
+                                let b = data[1] as i8;
+                                let c = data[2] as i8;
+                                let d = data[3] as i8;
+                                println!("[BLE] Motors: A={}% B={}% C={}% D={}%", a, b, c, d);
+                                BLE_MOTORS_ALL.signal([a, b, c, d]);
+                            } else {
+                                println!("[BLE] motors: expected 4 bytes, got {}", data.len());
                             }
-                        } else if handle == server.motor_control.motor_b.handle {
-                            if let Some(&val) = data.first() {
-                                let power = val as i8;
-                                if power >= -100 && power <= 100 {
-                                    println!("[BLE] Motor B set to {}%", power);
-                                    BLE_MOTOR_B_POWER.signal(power);
-                                }
-                            }
-                        } else if handle == server.motor_control.motor_c.handle {
-                            if let Some(&val) = data.first() {
-                                let power = val as i8;
-                                if power >= -100 && power <= 100 {
-                                    println!("[BLE] Motor C set to {}%", power);
-                                    BLE_MOTOR_C_POWER.signal(power);
-                                }
-                            }
-                        } else if handle == server.motor_control.motor_d.handle {
-                            if let Some(&val) = data.first() {
-                                let power = val as i8;
-                                if power >= -100 && power <= 100 {
-                                    println!("[BLE] Motor D set to {}%", power);
-                                    BLE_MOTOR_D_POWER.signal(power);
-                                }
-                            }
+                        } else if handle == server.motor_control.servo_angle.cccd_handle.unwrap()
+                            || handle == server.motor_control.motors.cccd_handle.unwrap()
+                        {
+                            let enabled = data.len() >= 2 && data[0] == 1;
+                            println!("[BLE] Notifications {} for handle {:?}", if enabled { "enabled" } else { "disabled" }, handle);
+                        } else {
+                            println!("[BLE] Unknown handle {:?}, data={:?}", handle, data);
                         }
                     }
                     GattEvent::Read(_) => {
                         // Reads are handled automatically by the GATT server
                     }
-                    _ => {}
+                    other => {
+                        println!("[BLE] Other GATT event: {:?}", core::any::type_name_of_val(other));
+                    }
                 }
                 // Accept and send the reply
                 match event.accept() {
@@ -145,7 +113,9 @@ async fn gatt_events_task<P: PacketPool>(
                     Err(e) => println!("[BLE] error sending GATT response: {:?}", e),
                 }
             }
-            _ => {} // ignore other events
+            other => {
+                println!("[BLE] Connection event: {:?}", core::any::type_name_of_val(&other));
+            }
         }
     };
     println!("[BLE] disconnected: {:?}", reason);
@@ -161,6 +131,12 @@ async fn advertise<'values, 'server, C: Controller>(
     peripheral: &mut Peripheral<'values, C, DefaultPacketPool>,
     server: &'server Server<'values>,
 ) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>> {
+    // Service UUID for scan_data so CoreBluetooth can discover by service UUID
+    // UUID e3910001-4567-4321-abcd-abcdef012345 in little-endian byte order
+    const SERVICE_UUID: [u8; 16] = [
+        0x45, 0x23, 0x01, 0xef, 0xcd, 0xab, 0xcd, 0xab,
+        0x21, 0x43, 0x67, 0x45, 0x01, 0x00, 0x91, 0xe3,
+    ];
     let mut advertiser_data = [0; 31];
     let len = AdStructure::encode_slice(
         &[
@@ -169,12 +145,17 @@ async fn advertise<'values, 'server, C: Controller>(
         ],
         &mut advertiser_data[..],
     )?;
+    let mut scan_response = [0; 31];
+    let scan_len = AdStructure::encode_slice(
+        &[AdStructure::ServiceUuids128(&[SERVICE_UUID])],
+        &mut scan_response[..],
+    )?;
     let advertiser = peripheral
         .advertise(
             &Default::default(),
             Advertisement::ConnectableScannableUndirected {
                 adv_data: &advertiser_data[..len],
-                scan_data: &[],
+                scan_data: &scan_response[..scan_len],
             },
         )
         .await?;
@@ -192,7 +173,7 @@ async fn advertise<'values, 'server, C: Controller>(
 pub async fn ble_task(connector: BleConnector<'static>) {
     let controller: ExternalController<_, 20> = ExternalController::new(connector);
 
-    let address = Address::random([0xff, 0x8f, 0x1a, 0x05, 0xe4, 0xff]);
+    let address = Address::random([0xff, 0x8f, 0x1a, 0x05, 0xe4, 0xfe]);
     println!("[BLE] address = {:?}", address);
 
     // Place HostResources in a static cell to avoid blowing the stack.

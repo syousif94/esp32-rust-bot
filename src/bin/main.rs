@@ -31,7 +31,7 @@ use esp_radio::wifi::{
 };
 use static_cell::StaticCell;
 use esp_radio::ble::controller::BleConnector;
-use esp32_http_servo::ble::{ble_task, BLE_SERVO_ANGLE, BLE_MOTOR_A_POWER, BLE_MOTOR_B_POWER, BLE_MOTOR_C_POWER, BLE_MOTOR_D_POWER};
+use esp32_http_servo::ble::{ble_task, BLE_SERVO_ANGLE, BLE_MOTORS_ALL};
 use esp32_http_servo::brushless::{BrushlessMotor, init_motor_timer};
 use esp32_http_servo::display::{display_task, init_display_state, update_motor_a, update_motor_b, update_motor_c, update_motor_d, update_ip, update_dots, update_status, WifiStatus, DisplaySender};
 use esp32_http_servo::http_server::{http_server_task, SERVO_ANGLE, MOTOR_A_POWER, MOTOR_B_POWER, MOTOR_C_POWER, MOTOR_D_POWER};
@@ -198,7 +198,6 @@ async fn main(spawner: Spawner) -> ! {
     // This runs immediately, allowing serial/BLE control before WiFi connects
     loop {
         // Wait for signal from any source: servo or motors A-D (HTTP/serial/BLE)
-        // Use nested select to handle 15 signals
         match select(
             select(
                 select4(
@@ -219,17 +218,9 @@ async fn main(spawner: Spawner) -> ! {
                     SERIAL_MOTOR_B_POWER.wait(),
                     SERIAL_MOTOR_C_POWER.wait(),
                     SERIAL_MOTOR_D_POWER.wait(),
-                    BLE_MOTOR_A_POWER.wait(),
+                    BLE_MOTORS_ALL.wait(),
                 ),
-                select4(
-                    BLE_MOTOR_B_POWER.wait(),
-                    BLE_MOTOR_C_POWER.wait(),
-                    BLE_MOTOR_D_POWER.wait(),
-                    embassy_futures::select::select(
-                        embassy_futures::yield_now(),
-                        core::future::pending::<()>(),
-                    ),
-                ),
+                embassy_futures::yield_now(),
             ),
         ).await {
             // HTTP servo
@@ -295,32 +286,21 @@ async fn main(spawner: Spawner) -> ! {
                 update_motor_d(&display_sender, power);
                 println!("Motor D set to {}% (serial)", power);
             }
-            // BLE Motor A
-            Either::Second(Either::First(Either4::Fourth(power))) => {
-                motor_a.set_power(power);
-                update_motor_a(&display_sender, power);
-                println!("Motor A set to {}% (BLE)", power);
+            // BLE Motors (all 4 at once)
+            Either::Second(Either::First(Either4::Fourth(motors))) => {
+                let [a, b, c, d] = motors;
+                motor_a.set_power(a);
+                motor_b.set_power(b);
+                motor_c.set_power(c);
+                motor_d.set_power(d);
+                update_motor_a(&display_sender, a);
+                update_motor_b(&display_sender, b);
+                update_motor_c(&display_sender, c);
+                update_motor_d(&display_sender, d);
+                println!("Motors set to A={}% B={}% C={}% D={}% (BLE)", a, b, c, d);
             }
-            // BLE Motor B
-            Either::Second(Either::Second(Either4::First(power))) => {
-                motor_b.set_power(power);
-                update_motor_b(&display_sender, power);
-                println!("Motor B set to {}% (BLE)", power);
-            }
-            // BLE Motor C
-            Either::Second(Either::Second(Either4::Second(power))) => {
-                motor_c.set_power(power);
-                update_motor_c(&display_sender, power);
-                println!("Motor C set to {}% (BLE)", power);
-            }
-            // BLE Motor D
-            Either::Second(Either::Second(Either4::Third(power))) => {
-                motor_d.set_power(power);
-                update_motor_d(&display_sender, power);
-                println!("Motor D set to {}% (BLE)", power);
-            }
-            // Unused slot (padding for select4)
-            Either::Second(Either::Second(Either4::Fourth(_))) => {}
+            // Unused slot (yield padding)
+            Either::Second(Either::Second(_)) => {}
         }
     }
 }
