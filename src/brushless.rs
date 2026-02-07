@@ -51,6 +51,7 @@ impl<'d> BrushlessMotor<'d> {
             duty_pct: 0,
             drive_mode: DriveMode::PushPull,
         }).unwrap();
+        channel_a.set_duty_hw(0);
         
         let mut channel_b = channel::Channel::new(channel_num_b, pin_b);
         channel_b.configure(channel::config::Config {
@@ -58,6 +59,7 @@ impl<'d> BrushlessMotor<'d> {
             duty_pct: 0,
             drive_mode: DriveMode::PushPull,
         }).unwrap();
+        channel_b.set_duty_hw(0);
         
         Self { channel_a, channel_b, name }
     }

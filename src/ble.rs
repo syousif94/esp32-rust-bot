@@ -149,6 +149,9 @@ async fn gatt_events_task<P: PacketPool>(
         }
     };
     println!("[BLE] disconnected: {:?}", reason);
+    // Flash disconnection message on the OLED display
+    let sender = crate::display::DISPLAY_STATE.sender();
+    crate::display::flash_message(&sender, "BLE Disconnected");
     Ok(())
 }
 
@@ -178,6 +181,9 @@ async fn advertise<'values, 'server, C: Controller>(
     println!("[BLE] advertising as '{}'...", name);
     let conn = advertiser.accept().await?.with_attribute_server(server)?;
     println!("[BLE] connection established");
+    // Flash a message on the OLED display
+    let sender = crate::display::DISPLAY_STATE.sender();
+    crate::display::flash_message(&sender, "BLE Connected");
     Ok(conn)
 }
 

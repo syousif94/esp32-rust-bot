@@ -14,6 +14,7 @@ use ssd1306::{
     Ssd1306,
 };
 use embedded_graphics::{
+    geometry::Size,
     mono_font::{ascii::FONT_6X10, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
     prelude::*,
@@ -49,6 +50,11 @@ pub struct DisplayState {
     pub ip: [u8; 4],
     pub status: WifiStatus,
     pub dots: u8,
+    /// Temporary flash message (e.g. "BLE Connected")
+    pub flash_message: [u8; 20],
+    pub flash_message_len: u8,
+    /// Remaining display cycles for the flash message (counts down to 0)
+    pub flash_ticks: u8,
 }
 
 /// Initialize the display state sender
@@ -119,6 +125,20 @@ pub fn update_dots(sender: &DisplaySender, dots: u8) {
     sender.send_modify(|state| {
         if let Some(s) = state {
             s.dots = dots;
+        }
+    });
+}
+
+/// Show a temporary flash message on the display for ~3 seconds
+pub fn flash_message(sender: &DisplaySender, msg: &str) {
+    sender.send_modify(|state| {
+        if let Some(s) = state {
+            let bytes = msg.as_bytes();
+            let len = bytes.len().min(s.flash_message.len());
+            s.flash_message[..len].copy_from_slice(&bytes[..len]);
+            s.flash_message_len = len as u8;
+            // ~6 ticks at 500ms each = ~3 seconds
+            s.flash_ticks = 6;
         }
     });
 }
@@ -212,6 +232,33 @@ pub async fn display_task(i2c: I2c<'static, Blocking>, ssid: &'static str) {
         let _ = write!(line_buf, "C:{:+4}% D:{:+4}%", state.motor_c, state.motor_d);
         let _ = Text::new(&line_buf, Point::new(0, 56), text_style).draw(&mut display);
         
+        // Flash message overlay (centered banner)
+        if state.flash_ticks > 0 {
+            let msg = core::str::from_utf8(&state.flash_message[..state.flash_message_len as usize]).unwrap_or("");
+            // Center the message horizontally (6px per char on 128px wide display)
+            let x = ((128i32 - (msg.len() as i32) * 6) / 2).max(0);
+            // Draw a blank band in the middle of the screen then the text
+            use embedded_graphics::primitives::{Rectangle, PrimitiveStyle};
+            let _ = Rectangle::new(Point::new(0, 24), Size::new(128, 16))
+                .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+                .draw(&mut display);
+            let _ = Rectangle::new(Point::new(x - 2, 24), Size::new((msg.len() as u32) * 6 + 4, 16))
+                .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+                .draw(&mut display);
+            let inverted_style = MonoTextStyleBuilder::new()
+                .font(&FONT_6X10)
+                .text_color(BinaryColor::Off)
+                .build();
+            let _ = Text::new(msg, Point::new(x, 34), inverted_style).draw(&mut display);
+
+            // Decrement flash ticks
+            DISPLAY_STATE.sender().send_modify(|s| {
+                if let Some(s) = s {
+                    s.flash_ticks = s.flash_ticks.saturating_sub(1);
+                }
+            });
+        }
+
         // Flush buffer to display
         let _ = display.flush();
         
