@@ -3,6 +3,7 @@
 //! Exposes a custom GATT service that a Swift app (CoreBluetooth) can connect to.
 //! Provides read/write characteristics for servo angle and motor power levels,
 //! using the same signals as the HTTP server and serial command modules.
+//! Also provides WiFi configuration characteristic for setting SSID/password via BLE.
 
 use embassy_futures::join::join;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -11,6 +12,7 @@ use esp_println::println;
 use esp_radio::ble::controller::BleConnector;
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
+use crate::wifi_config::{MAX_SSID_LEN, MAX_PASSWORD_LEN};
 
 /// Max number of BLE connections (1 is typical for a peripheral)
 const CONNECTIONS_MAX: usize = 1;
@@ -24,12 +26,19 @@ pub static BLE_SERVO_ANGLE: Signal<CriticalSectionRawMutex, u8> = Signal::new();
 /// Signal for all motors at once from BLE (a, b, c, d) — each -100 to +100
 pub static BLE_MOTORS_ALL: Signal<CriticalSectionRawMutex, [i8; 4]> = Signal::new();
 
+/// WiFi credentials received via BLE (SSID, password as heapless strings)
+pub type WifiCredentialsData = (heapless::String<MAX_SSID_LEN>, heapless::String<MAX_PASSWORD_LEN>);
+
+/// Signal to pass WiFi credentials to main task for flash storage
+pub static BLE_WIFI_CREDENTIALS: Signal<CriticalSectionRawMutex, WifiCredentialsData> = Signal::new();
+
 // Custom 128-bit UUIDs for our service and characteristics.
 // These are random UUIDs — the Swift app will scan for the service UUID.
 //
-// Service:     e3910001-4567-4321-abcd-abcdef012345
+// Service:     e3910010-4567-4321-abcd-abcdef012345 (updated for GATT cache refresh)
 // Servo:       e3910002-4567-4321-abcd-abcdef012345
 // Motors (4B): e3910003-4567-4321-abcd-abcdef012345
+// WiFi Config: e3910004-4567-4321-abcd-abcdef012345 (write SSID + password)
 
 /// GATT Server definition with our motor control service
 #[gatt_server]
@@ -38,7 +47,8 @@ struct Server {
 }
 
 /// Custom motor control GATT service
-#[gatt_service(uuid = "e3910001-4567-4321-abcd-abcdef012345")]
+/// Note: Service UUID incremented to e3910010 to force GATT cache refresh on clients
+#[gatt_service(uuid = "e3910010-4567-4321-abcd-abcdef012345")]
 struct MotorControlService {
     /// Servo angle (0-180), read + write + notify
     #[characteristic(uuid = "e3910002-4567-4321-abcd-abcdef012345", read, write, write_without_response, notify, value = 90)]
@@ -47,6 +57,11 @@ struct MotorControlService {
     /// All motors (4 bytes: A, B, C, D each -100..100), read + write + write_without_response + notify
     #[characteristic(uuid = "e3910003-4567-4321-abcd-abcdef012345", read, write, write_without_response, notify, value = [0, 0, 0, 0])]
     motors: [u8; 4],
+
+    /// WiFi config (write-only): format is "SSID\0PASSWORD" (null-separated)
+    /// Max 97 bytes: 32 (SSID) + 1 (null) + 64 (password)
+    #[characteristic(uuid = "e3910004-4567-4321-abcd-abcdef012345", write, value = [0u8; 97])]
+    wifi_config: [u8; 97],
 }
 
 /// Run the BLE host stack background task
@@ -91,6 +106,38 @@ async fn gatt_events_task<P: PacketPool>(
                             } else {
                                 println!("[BLE] motors: expected 4 bytes, got {}", data.len());
                             }
+                        } else if handle == server.motor_control.wifi_config.handle {
+                            // WiFi config format: "SSID\0PASSWORD" (null-separated)
+                            if let Some(null_pos) = data.iter().position(|&b| b == 0) {
+                                let ssid_bytes = &data[..null_pos];
+                                let pass_bytes = &data[null_pos + 1..];
+                                
+                                if let (Ok(ssid_str), Ok(pass_str)) = (
+                                    core::str::from_utf8(ssid_bytes),
+                                    core::str::from_utf8(pass_bytes),
+                                ) {
+                                    if ssid_str.is_empty() || ssid_str.len() > MAX_SSID_LEN {
+                                        println!("[BLE] WiFi config: invalid SSID length (1-{} bytes)", MAX_SSID_LEN);
+                                    } else if pass_str.len() > MAX_PASSWORD_LEN {
+                                        println!("[BLE] WiFi config: password too long (max {} bytes)", MAX_PASSWORD_LEN);
+                                    } else {
+                                        println!("[BLE] WiFi config: SSID='{}' (password {} chars)", ssid_str, pass_str.len());
+                                        // Create heapless strings to pass to main task
+                                        if let (Ok(ssid), Ok(password)) = (
+                                            heapless::String::try_from(ssid_str),
+                                            heapless::String::try_from(pass_str),
+                                        ) {
+                                            // Signal main task to save credentials
+                                            BLE_WIFI_CREDENTIALS.signal((ssid, password));
+                                            println!("[BLE] WiFi credentials queued for saving");
+                                        }
+                                    }
+                                } else {
+                                    println!("[BLE] WiFi config: invalid UTF-8 in SSID or password");
+                                }
+                            } else {
+                                println!("[BLE] WiFi config: expected null-separated SSID and password");
+                            }
                         } else if handle == server.motor_control.servo_angle.cccd_handle.unwrap()
                             || handle == server.motor_control.motors.cccd_handle.unwrap()
                         {
@@ -119,9 +166,9 @@ async fn gatt_events_task<P: PacketPool>(
         }
     };
     println!("[BLE] disconnected: {:?}", reason);
-    // Flash disconnection message on the OLED display
+    // Show disconnection on line 1 of the OLED display
     let sender = crate::display::DISPLAY_STATE.sender();
-    crate::display::flash_message(&sender, "BLE Disconnected");
+    crate::display::set_line1_override(&sender, "BLE: Disconnected");
     Ok(())
 }
 
@@ -132,10 +179,11 @@ async fn advertise<'values, 'server, C: Controller>(
     server: &'server Server<'values>,
 ) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>> {
     // Service UUID for scan_data so CoreBluetooth can discover by service UUID
-    // UUID e3910001-4567-4321-abcd-abcdef012345 in little-endian byte order
+    // UUID e3910010-4567-4321-abcd-abcdef012345 in little-endian byte order
+    // (updated from e3910001 to force GATT cache refresh on clients)
     const SERVICE_UUID: [u8; 16] = [
         0x45, 0x23, 0x01, 0xef, 0xcd, 0xab, 0xcd, 0xab,
-        0x21, 0x43, 0x67, 0x45, 0x01, 0x00, 0x91, 0xe3,
+        0x21, 0x43, 0x67, 0x45, 0x10, 0x00, 0x91, 0xe3,
     ];
     let mut advertiser_data = [0; 31];
     let len = AdStructure::encode_slice(
@@ -162,9 +210,9 @@ async fn advertise<'values, 'server, C: Controller>(
     println!("[BLE] advertising as '{}'...", name);
     let conn = advertiser.accept().await?.with_attribute_server(server)?;
     println!("[BLE] connection established");
-    // Flash a message on the OLED display
+    // Show BLE device name on line 1 of the OLED display
     let sender = crate::display::DISPLAY_STATE.sender();
-    crate::display::flash_message(&sender, "BLE Connected");
+    crate::display::set_line1_override(&sender, "BLE: Connected");
     Ok(conn)
 }
 

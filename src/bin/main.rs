@@ -7,6 +7,8 @@ use embassy_executor::Spawner;
 use embassy_net::{Runner, StackResources};
 use embassy_time::{Duration, Timer};
 use embassy_futures::select::{select, select4, Either, Either4};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use core::pin::pin;
 use esp_alloc as _;
 use esp_backtrace as _;
@@ -31,18 +33,24 @@ use esp_radio::wifi::{
 };
 use static_cell::StaticCell;
 use esp_radio::ble::controller::BleConnector;
-use esp32_http_servo::ble::{ble_task, BLE_SERVO_ANGLE, BLE_MOTORS_ALL};
+use esp_storage::FlashStorage;
+use esp32_http_servo::ble::{ble_task, BLE_SERVO_ANGLE, BLE_MOTORS_ALL, BLE_WIFI_CREDENTIALS};
 use esp32_http_servo::brushless::{BrushlessMotor, init_motor_timer};
-use esp32_http_servo::display::{display_task, init_display_state, update_motor_a, update_motor_b, update_motor_c, update_motor_d, update_ip, update_dots, update_status, WifiStatus, DisplaySender};
+use esp32_http_servo::display::{display_task, init_display_state, update_motor_a, update_motor_b, update_motor_c, update_motor_d, update_ip, update_dots, update_status, update_ssid, set_line1_override, WifiStatus, DisplaySender};
 use esp32_http_servo::http_server::{http_server_task, SERVO_ANGLE, MOTOR_A_POWER, MOTOR_B_POWER, MOTOR_C_POWER, MOTOR_D_POWER};
 use esp32_http_servo::serial_cmd::{serial_input_task, SERIAL_SERVO_ANGLE, SERIAL_MOTOR_A_POWER, SERIAL_MOTOR_B_POWER, SERIAL_MOTOR_C_POWER, SERIAL_MOTOR_D_POWER};
 use esp32_http_servo::servo::{ServoController, init_servo_timer};
+use esp32_http_servo::wifi_config::{read_wifi_credentials, write_wifi_credentials, MAX_SSID_LEN, MAX_PASSWORD_LEN};
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 esp_bootloader_esp_idf::esp_app_desc!();
 
 const SSID: &str = env!("WIFI_SSID");
 const PASSWORD: &str = env!("WIFI_PASSWORD");
+
+/// Signal to trigger WiFi reconnection with new credentials
+/// Contains (ssid, password) as heapless strings
+pub static WIFI_RECONNECT: Signal<CriticalSectionRawMutex, (heapless::String<MAX_SSID_LEN>, heapless::String<MAX_PASSWORD_LEN>)> = Signal::new();
 
 macro_rules! mk_static {
     ($t:ty,$val:expr) => {{
@@ -147,8 +155,8 @@ async fn main(spawner: Spawner) -> ! {
     println!("I2C initialized on GPIO5 (SDA) / GPIO4 (SCL) at 100kHz");
 
     // Initialize display state and spawn display task
-    let display_sender = init_display_state();
-    spawner.spawn(display_task(i2c, SSID)).ok();
+    let display_sender = init_display_state(SSID);
+    spawner.spawn(display_task(i2c)).ok();
     println!("OLED display task spawned");
 
     // Initialize esp-radio controller (shared by WiFi and BLE)
@@ -187,9 +195,18 @@ async fn main(spawner: Spawner) -> ! {
         seed,
     );
 
+    // Initialize flash storage for WiFi config persistence
+    // Place in static cell since embassy tasks need 'static lifetimes
+    let flash_storage = mk_static!(
+        FlashStorage<'static>,
+        FlashStorage::new(peripherals.FLASH)
+    );
+
     // Spawn background tasks
     spawner.spawn(ble_task(connector)).ok();
     println!("BLE task spawned");
+    spawner.spawn(wifi_config_task(flash_storage, display_sender.clone())).ok();
+    println!("WiFi config task spawned");
     spawner.spawn(connection(controller, display_sender.clone())).ok();
     spawner.spawn(net_task(runner)).ok();
     spawner.spawn(wifi_ready_task(spawner, stack, display_sender.clone())).ok();
@@ -305,6 +322,42 @@ async fn main(spawner: Spawner) -> ! {
     }
 }
 
+/// Task to handle WiFi credential saves to flash
+/// This runs in a separate task because flash operations can be slow
+#[embassy_executor::task]
+async fn wifi_config_task(flash_storage: &'static mut FlashStorage<'static>, display_sender: DisplaySender) {
+    // Check for stored credentials at startup and signal connection task
+    if let Some(creds) = read_wifi_credentials(flash_storage) {
+        println!("[WiFi Config] Found stored credentials: SSID='{}'", creds.ssid.as_str());
+        // Update display SSID
+        update_ssid(&display_sender, creds.ssid.as_str());
+        // Signal connection task to use stored credentials
+        WIFI_RECONNECT.signal((creds.ssid, creds.password));
+    }
+    
+    loop {
+        // Wait for WiFi credentials from BLE
+        let (ssid, password) = BLE_WIFI_CREDENTIALS.wait().await;
+        println!("[WiFi Config] Received WiFi credentials via BLE: SSID='{}'", ssid.as_str());
+        
+        // Save to flash
+        match write_wifi_credentials(flash_storage, ssid.as_str(), password.as_str()) {
+            Ok(()) => {
+                println!("[WiFi Config] Credentials saved successfully: SSID='{}'", ssid.as_str());
+                // Update display SSID
+                update_ssid(&display_sender, ssid.as_str());
+                set_line1_override(&display_sender, "WiFi Saved!");
+                // Signal connection task to reconnect with new credentials
+                WIFI_RECONNECT.signal((ssid, password));
+            }
+            Err(e) => {
+                println!("[WiFi Config] Failed to save credentials for SSID='{}': {}", ssid.as_str(), e);
+                set_line1_override(&display_sender, "Save Failed!");
+            }
+        }
+    }
+}
+
 #[embassy_executor::task]
 async fn wifi_ready_task(
     spawner: Spawner, 
@@ -361,43 +414,107 @@ async fn connection(mut controller: WifiController<'static>, display_sender: Dis
     println!("Start connection task");
     println!("Device capabilities: {:?}", controller.capabilities());
     
+    // Current credentials - start with compile-time defaults
+    let mut current_ssid: heapless::String<MAX_SSID_LEN> = heapless::String::try_from(SSID).unwrap_or_default();
+    let mut current_password: heapless::String<MAX_PASSWORD_LEN> = heapless::String::try_from(PASSWORD).unwrap_or_default();
+    
+    // Flag to track if we need to reconfigure
+    let mut needs_reconfigure = true;
+    
     loop {
+        // Check if new credentials are available (non-blocking check)
+        if WIFI_RECONNECT.signaled() {
+            let (new_ssid, new_password) = WIFI_RECONNECT.wait().await;
+            println!("[WiFi] New credentials received: SSID='{}'", new_ssid.as_str());
+            
+            // Only reconnect if credentials actually changed
+            if new_ssid.as_str() != current_ssid.as_str() || new_password.as_str() != current_password.as_str() {
+                current_ssid = new_ssid;
+                current_password = new_password;
+                needs_reconfigure = true;
+                
+                // Disconnect if currently connected
+                if matches!(sta_state(), WifiStaState::Connected) {
+                    println!("[WiFi] Disconnecting to switch networks...");
+                    let _ = controller.disconnect_async().await;
+                    Timer::after(Duration::from_millis(1000)).await;
+                }
+                
+                // Stop WiFi to reconfigure
+                if matches!(controller.is_started(), Ok(true)) {
+                    println!("[WiFi] Stopping WiFi for reconfiguration...");
+                    let _ = controller.stop_async().await;
+                    Timer::after(Duration::from_millis(500)).await;
+                }
+            }
+        }
+        
         match sta_state() {
             WifiStaState::Connected => {
-                // Wait until we're no longer connected
-                controller
-                    .wait_for_event(WifiEvent::StaDisconnected)
-                    .await;
-                Timer::after(Duration::from_millis(5000)).await
+                // Wait until we're no longer connected OR new credentials arrive
+                match select(
+                    controller.wait_for_event(WifiEvent::StaDisconnected),
+                    WIFI_RECONNECT.wait(),
+                ).await {
+                    Either::First(_) => {
+                        println!("[WiFi] Disconnected from network");
+                        Timer::after(Duration::from_millis(5000)).await;
+                    }
+                    Either::Second((new_ssid, new_password)) => {
+                        println!("[WiFi] New credentials while connected: SSID='{}'", new_ssid.as_str());
+                        if new_ssid.as_str() != current_ssid.as_str() || new_password.as_str() != current_password.as_str() {
+                            current_ssid = new_ssid;
+                            current_password = new_password;
+                            needs_reconfigure = true;
+                            
+                            println!("[WiFi] Disconnecting to switch networks...");
+                            let _ = controller.disconnect_async().await;
+                            Timer::after(Duration::from_millis(1000)).await;
+                            
+                            if matches!(controller.is_started(), Ok(true)) {
+                                let _ = controller.stop_async().await;
+                                Timer::after(Duration::from_millis(500)).await;
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
         
-        if !matches!(controller.is_started(), Ok(true)) {
+        if needs_reconfigure || !matches!(controller.is_started(), Ok(true)) {
             let client_config = ModeConfig::Client(
                 ClientConfig::default()
-                    .with_ssid(SSID.try_into().unwrap())
-                    .with_password(PASSWORD.try_into().unwrap()),
+                    .with_ssid(current_ssid.as_str().try_into().unwrap())
+                    .with_password(current_password.as_str().try_into().unwrap()),
             );
             controller.set_config(&client_config).unwrap();
+            needs_reconfigure = false;
             println!("Starting WiFi...");
             controller.start_async().await.unwrap();
             println!("WiFi started!");
         }
         
-        println!("Connecting to WiFi network: {}", SSID);
+        println!("Connecting to WiFi network: {}", current_ssid.as_str());
         
         // Animate "Connecting" message with 0-3 periods while waiting
         let mut connect_future = pin!(controller.connect_async());
         let mut period_count: u8 = 0;
+        let mut new_creds_arrived = false;
         
         let result = loop {
             match select(
                 &mut connect_future,
                 Timer::after(Duration::from_millis(1000)),
             ).await {
-                Either::First(result) => break result,
+                Either::First(result) => break Some(result),
                 Either::Second(_) => {
+                    // Also check for new credentials during connection attempt
+                    if WIFI_RECONNECT.signaled() {
+                        println!("[WiFi] New credentials during connection, will restart");
+                        new_creds_arrived = true;
+                        break None;
+                    }
                     period_count = (period_count + 1) % 4;
                     update_dots(&display_sender, period_count);
                     match period_count {
@@ -410,11 +527,19 @@ async fn connection(mut controller: WifiController<'static>, display_sender: Dis
             }
         };
         
+        if new_creds_arrived {
+            // Abort connection and loop back to pick up new credentials
+            continue;
+        }
+        
         match result {
-            Ok(_) => println!("WiFi connected!"),
-            Err(e) => {
+            Some(Ok(_)) => println!("WiFi connected!"),
+            Some(Err(e)) => {
                 println!("Failed to connect to WiFi: {:?}", e);
                 Timer::after(Duration::from_millis(5000)).await
+            }
+            None => {
+                // Connection aborted due to new credentials
             }
         }
     }

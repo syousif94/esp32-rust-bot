@@ -190,7 +190,7 @@ curl http://192.168.1.100/motor/a?power=80
 
 ## BLE GATT API
 
-The ESP32 advertises as a BLE peripheral named **"ESP32 Motor"**. It exposes a single custom GATT service with characteristics for each controllable output. WiFi and BLE run simultaneously via radio coexistence.
+The ESP32 advertises as a BLE peripheral named **"ESP32 Motor"**. It exposes a single custom GATT service with characteristics for each controllable output, plus WiFi configuration. WiFi and BLE run simultaneously via radio coexistence.
 
 ### Scanning
 
@@ -208,16 +208,17 @@ CoreBluetooth and Android can discover the device by scanning for the service UU
 
 | Field        | Value                                  |
 | ------------ | -------------------------------------- |
-| Service UUID | `E3910001-4567-4321-ABCD-ABCDEF012345` |
+| Service UUID | `E3910010-4567-4321-ABCD-ABCDEF012345` |
+
+> **Note:** Service UUID changed from `E3910001-...` to `E3910010-...` to force GATT cache refresh on clients after adding WiFi config characteristic.
 
 ### Characteristics
 
-Both characteristics support **Read**, **Write**, and **Notify**.
-
-| Name        | UUID                                   | Type      | Length  | Range         | Default        | Description                        |
-| ----------- | -------------------------------------- | --------- | ------- | ------------- | -------------- | ---------------------------------- |
-| Servo Angle | `E3910002-4567-4321-ABCD-ABCDEF012345` | u8        | 1 byte  | 0–180         | 90             | Servo position in degrees          |
-| Motors      | `E3910003-4567-4321-ABCD-ABCDEF012345` | `[i8; 4]` | 4 bytes | -100–100 each | `[0, 0, 0, 0]` | Motor A, B, C, D powers (in order) |
+| Name        | UUID                                   | Type      | Length  | Access | Range/Format                 | Default        | Description                           |
+| ----------- | -------------------------------------- | --------- | ------- | ------ | ---------------------------- | -------------- | ------------------------------------- |
+| Servo Angle | `E3910002-4567-4321-ABCD-ABCDEF012345` | u8        | 1 byte  | R/W/N  | 0–180                        | 90             | Servo position in degrees             |
+| Motors      | `E3910003-4567-4321-ABCD-ABCDEF012345` | `[i8; 4]` | 4 bytes | R/W/N  | -100–100 each                | `[0, 0, 0, 0]` | Motor A, B, C, D powers (in order)    |
+| WiFi Config | `E3910004-4567-4321-ABCD-ABCDEF012345` | bytes     | 1-97    | W      | `SSID\0PASSWORD` (see below) | —              | Set WiFi credentials, stored in flash |
 
 #### Motors Byte Layout
 
@@ -229,6 +230,33 @@ Both characteristics support **Read**, **Write**, and **Notify**.
 | 3    | D     | i8   | -100–100 |
 
 Writes with fewer than 4 bytes are ignored. All four motor powers are updated atomically in a single BLE write.
+
+#### WiFi Config Format
+
+The WiFi Config characteristic accepts a null-separated string containing the SSID and password:
+
+```
+SSID\0PASSWORD
+```
+
+| Field    | Max Length | Description                         |
+| -------- | ---------- | ----------------------------------- |
+| SSID     | 32 bytes   | WiFi network name (UTF-8)           |
+| `\0`     | 1 byte     | Null separator (0x00)               |
+| Password | 64 bytes   | WiFi password (UTF-8), can be empty |
+
+**Total max length:** 97 bytes (32 + 1 + 64)
+
+**Example (hex):** `MyNetwork` with password `secret123`
+
+```
+4D794E6574776F726B 00 736563726574313233
+│                  │  └── "secret123"
+│                  └── null separator
+└── "MyNetwork"
+```
+
+Credentials are stored in flash and persist across reboots. After writing new credentials, the device will use them on next boot. A "WiFi Saved!" message flashes on the OLED display upon successful write.
 
 ### Data Format
 
@@ -252,16 +280,18 @@ Reading a characteristic returns the last value set by any interface (BLE, HTTP,
 ```swift
 import CoreBluetooth
 
-// UUIDs
-let serviceUUID    = CBUUID(string: "E3910001-4567-4321-ABCD-ABCDEF012345")
+// UUIDs (Service UUID updated to E3910010 for GATT cache refresh)
+let serviceUUID    = CBUUID(string: "E3910010-4567-4321-ABCD-ABCDEF012345")
 let servoAngleUUID = CBUUID(string: "E3910002-4567-4321-ABCD-ABCDEF012345")
 let motorsUUID     = CBUUID(string: "E3910003-4567-4321-ABCD-ABCDEF012345")
+let wifiConfigUUID = CBUUID(string: "E3910004-4567-4321-ABCD-ABCDEF012345")
 
 class MotorController: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var centralManager: CBCentralManager!
     var peripheral: CBPeripheral?
     var servoChar: CBCharacteristic?
     var motorsChar: CBCharacteristic?
+    var wifiConfigChar: CBCharacteristic?
 
     override init() {
         super.init()
@@ -309,6 +339,7 @@ class MotorController: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate 
             switch char.uuid {
             case servoAngleUUID: servoChar = char
             case motorsUUID:     motorsChar = char
+            case wifiConfigUUID: wifiConfigChar = char
             default: break
             }
             // Enable notifications
@@ -335,6 +366,16 @@ class MotorController: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate 
             UInt8(bitPattern: c),
             UInt8(bitPattern: d)
         ])
+        p.writeValue(data, for: char, type: .withResponse)
+    }
+
+    /// Configure WiFi credentials (stored in flash, used on next boot)
+    func setWiFiCredentials(ssid: String, password: String) {
+        guard let char = wifiConfigChar, let p = peripheral else { return }
+        // Format: "SSID\0PASSWORD"
+        var data = Data(ssid.utf8)
+        data.append(0) // null separator
+        data.append(contentsOf: password.utf8)
         p.writeValue(data, for: char, type: .withResponse)
     }
 
@@ -366,9 +407,11 @@ import android.bluetooth.*
 import android.bluetooth.le.*
 import java.util.UUID
 
-val SERVICE_UUID     = UUID.fromString("E3910001-4567-4321-ABCD-ABCDEF012345")
+// UUIDs (Service UUID updated to E3910010 for GATT cache refresh)
+val SERVICE_UUID     = UUID.fromString("E3910010-4567-4321-ABCD-ABCDEF012345")
 val SERVO_ANGLE_UUID = UUID.fromString("E3910002-4567-4321-ABCD-ABCDEF012345")
 val MOTORS_UUID      = UUID.fromString("E3910003-4567-4321-ABCD-ABCDEF012345")
+val WIFI_CONFIG_UUID = UUID.fromString("E3910004-4567-4321-ABCD-ABCDEF012345")
 
 // Scan for the ESP32
 val scanner = bluetoothAdapter.bluetoothLeScanner
@@ -407,6 +450,13 @@ val gattCallback = object : BluetoothGattCallback() {
             (-50).toByte()  // Motor D: reverse 50%
         )
         gatt.writeCharacteristic(motorsChar)
+
+        // Configure WiFi credentials (stored in flash, used on next boot)
+        val wifiChar = service.getCharacteristic(WIFI_CONFIG_UUID)
+        val ssid = "MyNetwork"
+        val password = "secret123"
+        wifiChar.value = (ssid + "\u0000" + password).toByteArray(Charsets.UTF_8)
+        gatt.writeCharacteristic(wifiChar)
     }
 }
 ```

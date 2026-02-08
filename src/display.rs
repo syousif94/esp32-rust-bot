@@ -50,19 +50,44 @@ pub struct DisplayState {
     pub ip: [u8; 4],
     pub status: WifiStatus,
     pub dots: u8,
-    /// Temporary flash message (e.g. "BLE Connected")
+    /// Current WiFi SSID to display
+    pub ssid: [u8; 32],
+    pub ssid_len: u8,
+    /// Temporary line 1 override (e.g. "BLE: Device" or "WiFi Saved")
+    pub line1_override: [u8; 21],
+    pub line1_override_len: u8,
+    /// Remaining display cycles for line1 override (counts down to 0)
+    pub line1_ticks: u8,
+    /// Temporary flash message (e.g. "BLE Connected") - DEPRECATED, use line1_override
     pub flash_message: [u8; 20],
     pub flash_message_len: u8,
     /// Remaining display cycles for the flash message (counts down to 0)
     pub flash_ticks: u8,
 }
 
-/// Initialize the display state sender
-pub fn init_display_state() -> DisplaySender {
+/// Initialize the display state sender with initial SSID
+pub fn init_display_state(initial_ssid: &str) -> DisplaySender {
     let sender = DISPLAY_STATE.sender();
-    // Initialize with default state
-    sender.send(DisplayState::default());
+    // Initialize with default state and SSID
+    let mut state = DisplayState::default();
+    let bytes = initial_ssid.as_bytes();
+    let len = bytes.len().min(state.ssid.len());
+    state.ssid[..len].copy_from_slice(&bytes[..len]);
+    state.ssid_len = len as u8;
+    sender.send(state);
     sender
+}
+
+/// Update the WiFi SSID in display state
+pub fn update_ssid(sender: &DisplaySender, ssid: &str) {
+    sender.send_modify(|state| {
+        if let Some(s) = state {
+            let bytes = ssid.as_bytes();
+            let len = bytes.len().min(s.ssid.len());
+            s.ssid[..len].copy_from_slice(&bytes[..len]);
+            s.ssid_len = len as u8;
+        }
+    });
 }
 
 /// Update motor A power in display state
@@ -143,9 +168,24 @@ pub fn flash_message(sender: &DisplaySender, msg: &str) {
     });
 }
 
+/// Override line 1 temporarily (replaces WiFi SSID line for ~3 seconds)
+pub fn set_line1_override(sender: &DisplaySender, msg: &str) {
+    println!("[Display] Setting line1 override: '{}'", msg);
+    sender.send_modify(|state| {
+        if let Some(s) = state {
+            let bytes = msg.as_bytes();
+            let len = bytes.len().min(s.line1_override.len());
+            s.line1_override[..len].copy_from_slice(&bytes[..len]);
+            s.line1_override_len = len as u8;
+            // ~6 ticks at 500ms each = ~3 seconds
+            s.line1_ticks = 6;
+        }
+    });
+}
+
 /// OLED display task - updates the display periodically
 #[embassy_executor::task]
-pub async fn display_task(i2c: I2c<'static, Blocking>, ssid: &'static str) {
+pub async fn display_task(i2c: I2c<'static, Blocking>) {
     println!("Starting OLED display task...");
     
     // Create display interface
@@ -186,16 +226,29 @@ pub async fn display_task(i2c: I2c<'static, Blocking>, ssid: &'static str) {
     // Buffer for formatting text
     let mut line_buf: heapless::String<32> = heapless::String::new();
     
+    // Wait for initial state to be available
+    let mut state = receiver.changed().await;
+    
     loop {
-        // Get current state (wait for it to be available)
-        let state = receiver.get().await;
         
         // Clear display buffer
         display.clear_buffer();
         
-        // Line 1: WiFi SSID (truncate if needed)
+        // Line 1: WiFi SSID or temporary override (BLE connection, etc.)
         line_buf.clear();
-        let _ = write!(line_buf, "WiFi: {}", if ssid.len() > 15 { &ssid[..15] } else { ssid });
+        if state.line1_ticks > 0 {
+            let override_msg = core::str::from_utf8(&state.line1_override[..state.line1_override_len as usize]).unwrap_or("");
+            let _ = write!(line_buf, "{}", override_msg);
+            // Decrement line1 ticks
+            DISPLAY_STATE.sender().send_modify(|s| {
+                if let Some(s) = s {
+                    s.line1_ticks = s.line1_ticks.saturating_sub(1);
+                }
+            });
+        } else {
+            let ssid = core::str::from_utf8(&state.ssid[..state.ssid_len as usize]).unwrap_or("");
+            let _ = write!(line_buf, "WiFi: {}", if ssid.len() > 15 { &ssid[..15] } else { ssid });
+        }
         let _ = Text::new(&line_buf, Point::new(0, 10), text_style).draw(&mut display);
         
         // Line 2: IP Address
@@ -263,9 +316,19 @@ pub async fn display_task(i2c: I2c<'static, Blocking>, ssid: &'static str) {
         let _ = display.flush();
         
         // Wait for state change or timeout (update at least every 500ms)
-        let _ = embassy_futures::select::select(
+        match embassy_futures::select::select(
             receiver.changed(),
             Timer::after(Duration::from_millis(500)),
-        ).await;
+        ).await {
+            embassy_futures::select::Either::First(new_state) => {
+                state = new_state;
+            }
+            embassy_futures::select::Either::Second(_) => {
+                // Timeout - re-read current state for tick countdown
+                if let Some(s) = receiver.try_get() {
+                    state = s;
+                }
+            }
+        }
     }
 }
