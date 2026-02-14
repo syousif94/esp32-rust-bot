@@ -179,14 +179,17 @@
 
       const baseUrl = `http://${window.location.host}`;
 
-      const radius = 140; // half of joystick-area width
+      // Timing constants
+      const SEND_INTERVAL_MS = 100; // Send commands at ~10 Hz while active
+      const FETCH_TIMEOUT_MS = 400; // Abort fetch if no response in 400ms
+      const STOP_RETRIES = 3; // Retry stop command this many times
+
+      const radius = 140;
       let dragging = false;
       let currentLeft = 0;
       let currentRight = 0;
-      let sending = false;
-      let needsSend = false;
-      let lastSentLeft = null;
-      let lastSentRight = null;
+      let sendTimer = null;
+      let inFlight = false;
 
       function getCenter() {
         const rect = joystick.getBoundingClientRect();
@@ -202,7 +205,6 @@
         let dx = clientX - c.x;
         let dy = clientY - c.y;
 
-        // Clamp to circle
         const dist = Math.sqrt(dx * dx + dy * dy);
         if (dist > radius) {
           dx = (dx / dist) * radius;
@@ -212,19 +214,13 @@
         dot.style.left = `calc(50% + ${dx}px)`;
         dot.style.top = `calc(50% + ${dy}px)`;
 
-        // Normalize to -1..1 (y inverted: up = positive)
         const nx = dx / radius;
         const ny = -dy / radius;
 
-        // Tank drive mixing
-        let left = clamp(Math.round((ny + nx) * 100), -100, 100);
-        let right = clamp(Math.round((ny - nx) * 100), -100, 100);
+        currentLeft = clamp(Math.round((ny + nx) * 100), -100, 100);
+        currentRight = clamp(Math.round((ny - nx) * 100), -100, 100);
 
-        currentLeft = left;
-        currentRight = right;
-
-        updateDisplay(left, right);
-        scheduleSend();
+        updateDisplay(currentLeft, currentRight);
       }
 
       function resetDot() {
@@ -233,7 +229,6 @@
         currentLeft = 0;
         currentRight = 0;
         updateDisplay(0, 0);
-        sendMotorValues(0, 0);
       }
 
       function updateDisplay(left, right) {
@@ -245,51 +240,89 @@
           'value ' + (right > 0 ? 'pos' : right < 0 ? 'neg' : 'zero');
       }
 
-      // Sequential sending — waits for response, then sends latest position
-      function scheduleSend() {
-        if (currentLeft === lastSentLeft && currentRight === lastSentRight)
-          return;
-        if (sending) {
-          needsSend = true;
-          return;
-        }
-        sendMotorValues(currentLeft, currentRight);
+      // -- Fixed-rate send loop -----------------------------------------
+      // While the joystick is active, fire a command every SEND_INTERVAL_MS.
+      // If the previous request is still in-flight, skip that tick.
+      // This feeds the ESP32 watchdog (500ms) and always sends the latest
+      // joystick values rather than queuing stale ones.
+
+      function startSending() {
+        if (sendTimer) return;
+        fireCommand(); // immediate first send
+        sendTimer = setInterval(fireCommand, SEND_INTERVAL_MS);
       }
 
-      async function sendMotorValues(left, right) {
-        sending = true;
-        needsSend = false;
-
-        try {
-          await fetch(
-            `${baseUrl}/motors?a=${left}&b=${right}&c=${left}&d=${right}`,
-          );
-          lastSentLeft = left;
-          lastSentRight = right;
-          statusEl.textContent = `Connected — L:${left} R:${right}`;
-          statusEl.className = 'status ok';
-        } catch (e) {
-          statusEl.textContent = 'Connection error';
-          statusEl.className = 'status err';
+      function stopSending() {
+        if (sendTimer) {
+          clearInterval(sendTimer);
+          sendTimer = null;
         }
-
-        sending = false;
-        // If joystick moved during the fetch, send the latest values if changed
-        if (
-          needsSend &&
-          (currentLeft !== lastSentLeft || currentRight !== lastSentRight)
-        ) {
-          sendMotorValues(currentLeft, currentRight);
-        }
+        sendStopReliably();
       }
 
-      // Pointer events (mouse + touch unified)
+      function fireCommand() {
+        if (inFlight) return; // previous request still pending — skip this tick
+        inFlight = true;
+
+        const abort = new AbortController();
+        const timeout = setTimeout(() => abort.abort(), FETCH_TIMEOUT_MS);
+        const l = currentLeft;
+        const r = currentRight;
+
+        fetch(`${baseUrl}/motors?a=${l}&b=${r}&c=${l}&d=${r}`, {
+          signal: abort.signal,
+        })
+          .then(() => {
+            clearTimeout(timeout);
+            statusEl.textContent = `OK — L:${l} R:${r}`;
+            statusEl.className = 'status ok';
+          })
+          .catch((e) => {
+            clearTimeout(timeout);
+            if (e.name !== 'AbortError') {
+              statusEl.textContent = 'Send error';
+              statusEl.className = 'status err';
+            }
+          })
+          .finally(() => {
+            inFlight = false;
+          });
+      }
+
+      // Retry stop command multiple times for reliability.
+      // Even if all retries fail, the ESP32 watchdog will stop motors
+      // within 500ms.
+      async function sendStopReliably() {
+        for (let attempt = 0; attempt < STOP_RETRIES; attempt++) {
+          try {
+            const c = new AbortController();
+            const t = setTimeout(() => c.abort(), 500);
+            await fetch(`${baseUrl}/motors?a=0&b=0&c=0&d=0`, {
+              signal: c.signal,
+            });
+            clearTimeout(t);
+            statusEl.textContent = 'Stopped';
+            statusEl.className = 'status ok';
+            return;
+          } catch (e) {
+            if (attempt < STOP_RETRIES - 1) {
+              await new Promise((r) => setTimeout(r, 50));
+            }
+          }
+        }
+        statusEl.textContent = 'Stop retries failed — watchdog will engage';
+        statusEl.className = 'status err';
+      }
+
+      // -- Pointer events (mouse + touch unified) -----------------------
+
       function onStart(e) {
         e.preventDefault();
         dragging = true;
         dot.classList.add('active');
         const pt = e.touches ? e.touches[0] : e;
         updateDot(pt.clientX, pt.clientY);
+        startSending();
       }
 
       function onMove(e) {
@@ -304,9 +337,9 @@
         dragging = false;
         dot.classList.remove('active');
         resetDot();
+        stopSending();
       }
 
-      // Attach to joystick area so tapping anywhere in the ring works
       joystick.addEventListener('mousedown', onStart);
       joystick.addEventListener('touchstart', onStart, { passive: false });
       window.addEventListener('mousemove', onMove);
@@ -315,23 +348,41 @@
       window.addEventListener('touchend', onEnd);
       window.addEventListener('touchcancel', onEnd);
 
-      // Keyboard fallback — arrow keys
+      // -- Safety: stop motors if browser tab goes hidden ---------------
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden && (dragging || sendTimer)) {
+          dragging = false;
+          dot.classList.remove('active');
+          resetDot();
+          stopSending();
+        }
+      });
+
+      // -- Keyboard fallback — arrow keys -------------------------------
       const keys = {};
+
       window.addEventListener('keydown', (e) => {
         if (
           ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)
         ) {
           e.preventDefault();
+          const wasIdle = !Object.values(keys).some(Boolean);
           keys[e.key] = true;
           updateFromKeys();
+          if (wasIdle) startSending();
         }
       });
+
       window.addEventListener('keyup', (e) => {
         if (
           ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)
         ) {
           keys[e.key] = false;
           updateFromKeys();
+          if (!Object.values(keys).some(Boolean)) {
+            resetDot();
+            stopSending();
+          }
         }
       });
 
@@ -343,17 +394,13 @@
         if (keys['ArrowRight']) x += 1;
         if (keys['ArrowLeft']) x -= 1;
 
-        const left = clamp(Math.round((y + x) * 100), -100, 100);
-        const right = clamp(Math.round((y - x) * 100), -100, 100);
-        currentLeft = left;
-        currentRight = right;
+        currentLeft = clamp(Math.round((y + x) * 100), -100, 100);
+        currentRight = clamp(Math.round((y - x) * 100), -100, 100);
 
-        // Move dot visually
         dot.style.left = `calc(50% + ${x * radius}px)`;
         dot.style.top = `calc(50% + ${-y * radius}px)`;
 
-        updateDisplay(left, right);
-        scheduleSend();
+        updateDisplay(currentLeft, currentRight);
       }
     </script>
   </body>

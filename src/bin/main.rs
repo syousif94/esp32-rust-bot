@@ -4,12 +4,9 @@
 extern crate alloc;
 
 use embassy_executor::Spawner;
-use embassy_net::{Runner, StackResources};
-use embassy_time::{Duration, Timer};
-use embassy_futures::select::{select, select4, Either, Either4};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::signal::Signal;
-use core::pin::pin;
+use embassy_futures::select::{select, Either};
+use embassy_net::StackResources;
+use embassy_time::{Duration, Instant};
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::{
@@ -19,45 +16,37 @@ use esp_hal::{
     rng::Rng,
     time::Rate,
     timer::timg::TimerGroup,
-    uart::{Uart, Config as UartConfig},
+    uart::{Config as UartConfig, Uart},
 };
 use esp_println::println;
-use esp_radio::wifi::{
-    ClientConfig,
-    ModeConfig,
-    WifiController,
-    WifiDevice,
-    WifiEvent,
-    WifiStaState,
-    sta_state,
-};
-use static_cell::StaticCell;
 use esp_radio::ble::controller::BleConnector;
 use esp_storage::FlashStorage;
-use esp32_http_servo::ble::{ble_task, BLE_SERVO_ANGLE, BLE_MOTORS_ALL, BLE_WIFI_CREDENTIALS};
-use esp32_http_servo::brushless::{BrushlessMotor, init_motor_timer};
-use esp32_http_servo::display::{display_task, init_display_state, update_motor_a, update_motor_b, update_motor_c, update_motor_d, update_ip, update_dots, update_status, update_ssid, set_line1_override, WifiStatus, DisplaySender};
-use esp32_http_servo::http_server::{http_server_task, SERVO_ANGLE, MOTOR_A_POWER, MOTOR_B_POWER, MOTOR_C_POWER, MOTOR_D_POWER};
-use esp32_http_servo::serial_cmd::{serial_input_task, SERIAL_SERVO_ANGLE, SERIAL_MOTOR_A_POWER, SERIAL_MOTOR_B_POWER, SERIAL_MOTOR_C_POWER, SERIAL_MOTOR_D_POWER};
-use esp32_http_servo::servo::{ServoController, init_servo_timer};
-use esp32_http_servo::wifi_config::{read_wifi_credentials, write_wifi_credentials, MAX_SSID_LEN, MAX_PASSWORD_LEN};
+use static_cell::StaticCell;
 
-// This creates a default app-descriptor required by the esp-idf bootloader.
+use esp32_http_servo::brushless::{init_motor_timer, BrushlessMotor};
+use esp32_http_servo::commands::{Command, COMMANDS};
+use esp32_http_servo::display::{display_task, init_display_state, update_motor, DisplaySender};
+use esp32_http_servo::servo::{init_servo_timer, ServoController};
+
+use esp32_http_servo::ble::ble_task;
+use esp32_http_servo::serial_cmd::serial_input_task;
+use esp32_http_servo::wifi::{
+    default_ssid, net_task, wifi_config_task, wifi_connection_task, wifi_ready_task,
+};
+
+// Required by the esp-idf bootloader.
 esp_bootloader_esp_idf::esp_app_desc!();
 
-const SSID: &str = env!("WIFI_SSID");
-const PASSWORD: &str = env!("WIFI_PASSWORD");
-
-/// Signal to trigger WiFi reconnection with new credentials
-/// Contains (ssid, password) as heapless strings
-pub static WIFI_RECONNECT: Signal<CriticalSectionRawMutex, (heapless::String<MAX_SSID_LEN>, heapless::String<MAX_PASSWORD_LEN>)> = Signal::new();
-
 macro_rules! mk_static {
-    ($t:ty,$val:expr) => {{
+    ($t:ty, $val:expr) => {{
         static STATIC_CELL: StaticCell<$t> = StaticCell::new();
         STATIC_CELL.uninit().write($val)
     }};
 }
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -65,29 +54,18 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // Initialize heap allocator
-    // NOTE: 64KB heap balances WiFi/radio memory needs with stack space.
-    // BLE large objects are in static cells, but the Server struct is temporarily
-    // constructed on the stack before being moved, requiring extra headroom.
+    // Heap + RTOS timer
     esp_alloc::heap_allocator!(size: 64 * 1024);
-
-    // Initialize timer and software interrupt for esp-rtos
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
 
-    // Initialize UART for serial commands (uses USB-serial on most dev boards)
-    let uart0 = Uart::new(
-        peripherals.UART0,
-        UartConfig::default(),
-    ).unwrap();
-    
-    // Spawn serial command task
+    // -- UART (serial commands) ----------------------------------------
+    let uart0 = Uart::new(peripherals.UART0, UartConfig::default()).unwrap();
     spawner.spawn(serial_input_task(uart0)).ok();
 
-    // Initialize LEDC peripheral
+    // -- LEDC / servo / motors ------------------------------------------
     let ledc = mk_static!(Ledc<'static>, Ledc::new(peripherals.LEDC));
-    
-    // Initialize servo timer (50Hz) and servo on GPIO18
+
     let servo_timer = mk_static!(
         esp_hal::ledc::timer::Timer<'static, esp_hal::ledc::HighSpeed>,
         init_servo_timer(ledc)
@@ -95,82 +73,48 @@ async fn main(spawner: Spawner) -> ! {
     let mut servo = ServoController::new(servo_timer, peripherals.GPIO18);
     servo.set_angle(90);
     println!("Servo initialized on GPIO18 at 90 degrees");
-    
-    // Initialize motor timer (1kHz for responsive H-bridge control)
+
     let motor_timer = mk_static!(
         esp_hal::ledc::timer::Timer<'static, esp_hal::ledc::HighSpeed>,
         init_motor_timer(ledc)
     );
-    
-    // Initialize Motor A on GPIO32 (forward) and GPIO33 (reverse)
-    let mut motor_a = BrushlessMotor::new(
-        motor_timer,
-        peripherals.GPIO32,
-        peripherals.GPIO33,
-        esp_hal::ledc::channel::Number::Channel1,
-        esp_hal::ledc::channel::Number::Channel2,
-        "Motor A",
-    );
-    println!("Motor A initialized on GPIO32/GPIO33");
-    
-    // Initialize Motor B on GPIO25 (forward) and GPIO26 (reverse)
-    let mut motor_b = BrushlessMotor::new(
-        motor_timer,
-        peripherals.GPIO25,
-        peripherals.GPIO26,
-        esp_hal::ledc::channel::Number::Channel3,
-        esp_hal::ledc::channel::Number::Channel4,
-        "Motor B",
-    );
-    println!("Motor B initialized on GPIO25/GPIO26");
-    
-    // Initialize Motor C on GPIO19 (forward) and GPIO21 (reverse)
-    let mut motor_c = BrushlessMotor::new(
-        motor_timer,
-        peripherals.GPIO19,
-        peripherals.GPIO21,
-        esp_hal::ledc::channel::Number::Channel5,
-        esp_hal::ledc::channel::Number::Channel6,
-        "Motor C",
-    );
-    println!("Motor C initialized on GPIO19/GPIO21");
-    
-    // Initialize Motor D on GPIO22 (forward) and GPIO23 (reverse)
-    let mut motor_d = BrushlessMotor::new(
-        motor_timer,
-        peripherals.GPIO22,
-        peripherals.GPIO23,
-        esp_hal::ledc::channel::Number::Channel7,
-        esp_hal::ledc::channel::Number::Channel0,
-        "Motor D",
-    );
-    println!("Motor D initialized on GPIO22/GPIO23");
+    let mut motors = [
+        BrushlessMotor::new(motor_timer, peripherals.GPIO32, peripherals.GPIO33,
+            esp_hal::ledc::channel::Number::Channel1, esp_hal::ledc::channel::Number::Channel2, "Motor A"),
+        BrushlessMotor::new(motor_timer, peripherals.GPIO25, peripherals.GPIO26,
+            esp_hal::ledc::channel::Number::Channel3, esp_hal::ledc::channel::Number::Channel4, "Motor B"),
+        BrushlessMotor::new(motor_timer, peripherals.GPIO19, peripherals.GPIO21,
+            esp_hal::ledc::channel::Number::Channel5, esp_hal::ledc::channel::Number::Channel6, "Motor C"),
+        BrushlessMotor::new(motor_timer, peripherals.GPIO22, peripherals.GPIO23,
+            esp_hal::ledc::channel::Number::Channel7, esp_hal::ledc::channel::Number::Channel0, "Motor D"),
+    ];
 
-    // Initialize I2C for OLED display (GPIO5 = SDA, GPIO4 = SCL)
-    let i2c_config = I2cConfig::default().with_frequency(Rate::from_khz(100));
-    let i2c = I2c::new(peripherals.I2C0, i2c_config)
-        .unwrap()
-        .with_sda(peripherals.GPIO4)
-        .with_scl(peripherals.GPIO5);
+    // -- I2C / OLED display ---------------------------------------------
+    let i2c = I2c::new(
+        peripherals.I2C0,
+        I2cConfig::default().with_frequency(Rate::from_khz(100)),
+    )
+    .unwrap()
+    .with_sda(peripherals.GPIO4)
+    .with_scl(peripherals.GPIO5);
     println!("I2C initialized on GPIO5 (SDA) / GPIO4 (SCL) at 100kHz");
 
-    // Initialize display state and spawn display task
-    let display_sender = init_display_state(SSID);
+    let display_sender = init_display_state(default_ssid());
     spawner.spawn(display_task(i2c)).ok();
     println!("OLED display task spawned");
 
-    // Initialize esp-radio controller (shared by WiFi and BLE)
-    let esp_radio_controller = mk_static!(esp_radio::Controller<'static>, esp_radio::init().unwrap());
+    // -- Radio (WiFi + BLE) ---------------------------------------------
+    let esp_radio_controller =
+        mk_static!(esp_radio::Controller<'static>, esp_radio::init().unwrap());
 
-    // Initialize BLE connector (must be created alongside WiFi for coex)
     let connector = BleConnector::new(
         esp_radio_controller,
         peripherals.BT,
         Default::default(),
-    ).unwrap();
+    )
+    .unwrap();
     println!("BLE connector initialized");
 
-    // Initialize WiFi
     let (controller, interfaces) = esp_radio::wifi::new(
         esp_radio_controller,
         peripherals.WIFI,
@@ -178,374 +122,92 @@ async fn main(spawner: Spawner) -> ! {
     )
     .unwrap();
 
-    let wifi_interface = interfaces.sta;
-
-    // Configure DHCP
     let net_config = embassy_net::Config::dhcpv4(Default::default());
-
-    // Generate random seed for network stack
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
 
-    // Initialize network stack
     let (stack, runner) = embassy_net::new(
-        wifi_interface,
+        interfaces.sta,
         net_config,
         mk_static!(StackResources<5>, StackResources::<5>::new()),
         seed,
     );
 
-    // Initialize flash storage for WiFi config persistence
-    // Place in static cell since embassy tasks need 'static lifetimes
     let flash_storage = mk_static!(
         FlashStorage<'static>,
         FlashStorage::new(peripherals.FLASH)
     );
 
-    // Spawn background tasks
+    // -- Spawn background tasks -----------------------------------------
     spawner.spawn(ble_task(connector)).ok();
-    println!("BLE task spawned");
     spawner.spawn(wifi_config_task(flash_storage, display_sender.clone())).ok();
-    println!("WiFi config task spawned");
-    spawner.spawn(connection(controller, display_sender.clone())).ok();
+    spawner.spawn(wifi_connection_task(controller, display_sender.clone())).ok();
     spawner.spawn(net_task(runner)).ok();
     spawner.spawn(wifi_ready_task(spawner, stack, display_sender.clone())).ok();
 
-    // Main loop - handle servo and motor updates from HTTP, serial, or BLE
-    // This runs immediately, allowing serial/BLE control before WiFi connects
-    loop {
-        // Wait for signal from any source: servo or motors A-D (HTTP/serial/BLE)
-        match select(
-            select(
-                select4(
-                    SERVO_ANGLE.wait(),
-                    SERIAL_SERVO_ANGLE.wait(),
-                    BLE_SERVO_ANGLE.wait(),
-                    MOTOR_A_POWER.wait(),
-                ),
-                select4(
-                    MOTOR_B_POWER.wait(),
-                    MOTOR_C_POWER.wait(),
-                    MOTOR_D_POWER.wait(),
-                    SERIAL_MOTOR_A_POWER.wait(),
-                ),
-            ),
-            select(
-                select4(
-                    SERIAL_MOTOR_B_POWER.wait(),
-                    SERIAL_MOTOR_C_POWER.wait(),
-                    SERIAL_MOTOR_D_POWER.wait(),
-                    BLE_MOTORS_ALL.wait(),
-                ),
-                embassy_futures::yield_now(),
-            ),
-        ).await {
-            // HTTP servo
-            Either::First(Either::First(Either4::First(angle))) => {
-                servo.set_angle(angle);
-                println!("Servo moved to {} degrees", angle);
-            }
-            // Serial servo
-            Either::First(Either::First(Either4::Second(angle))) => {
-                servo.set_angle(angle);
-                println!("Servo moved to {} degrees (serial)", angle);
-            }
-            // BLE servo
-            Either::First(Either::First(Either4::Third(angle))) => {
-                servo.set_angle(angle);
-                println!("Servo moved to {} degrees (BLE)", angle);
-            }
-            // HTTP Motor A
-            Either::First(Either::First(Either4::Fourth(power))) => {
-                motor_a.set_power(power);
-                update_motor_a(&display_sender, power);
-                println!("Motor A set to {}%", power);
-            }
-            // HTTP Motor B
-            Either::First(Either::Second(Either4::First(power))) => {
-                motor_b.set_power(power);
-                update_motor_b(&display_sender, power);
-                println!("Motor B set to {}%", power);
-            }
-            // HTTP Motor C
-            Either::First(Either::Second(Either4::Second(power))) => {
-                motor_c.set_power(power);
-                update_motor_c(&display_sender, power);
-                println!("Motor C set to {}%", power);
-            }
-            // HTTP Motor D
-            Either::First(Either::Second(Either4::Third(power))) => {
-                motor_d.set_power(power);
-                update_motor_d(&display_sender, power);
-                println!("Motor D set to {}%", power);
-            }
-            // Serial Motor A
-            Either::First(Either::Second(Either4::Fourth(power))) => {
-                motor_a.set_power(power);
-                update_motor_a(&display_sender, power);
-                println!("Motor A set to {}% (serial)", power);
-            }
-            // Serial Motor B
-            Either::Second(Either::First(Either4::First(power))) => {
-                motor_b.set_power(power);
-                update_motor_b(&display_sender, power);
-                println!("Motor B set to {}% (serial)", power);
-            }
-            // Serial Motor C
-            Either::Second(Either::First(Either4::Second(power))) => {
-                motor_c.set_power(power);
-                update_motor_c(&display_sender, power);
-                println!("Motor C set to {}% (serial)", power);
-            }
-            // Serial Motor D
-            Either::Second(Either::First(Either4::Third(power))) => {
-                motor_d.set_power(power);
-                update_motor_d(&display_sender, power);
-                println!("Motor D set to {}% (serial)", power);
-            }
-            // BLE Motors (all 4 at once)
-            Either::Second(Either::First(Either4::Fourth(motors))) => {
-                let [a, b, c, d] = motors;
-                motor_a.set_power(a);
-                motor_b.set_power(b);
-                motor_c.set_power(c);
-                motor_d.set_power(d);
-                update_motor_a(&display_sender, a);
-                update_motor_b(&display_sender, b);
-                update_motor_c(&display_sender, c);
-                update_motor_d(&display_sender, d);
-                println!("Motors set to A={}% B={}% C={}% D={}% (BLE)", a, b, c, d);
-            }
-            // Unused slot (yield padding)
-            Either::Second(Either::Second(_)) => {}
-        }
-    }
+    // -- Command loop ---------------------------------------------------
+    command_loop(&mut servo, &mut motors, &display_sender).await
 }
 
-/// Task to handle WiFi credential saves to flash
-/// This runs in a separate task because flash operations can be slow
-#[embassy_executor::task]
-async fn wifi_config_task(flash_storage: &'static mut FlashStorage<'static>, display_sender: DisplaySender) {
-    // Check for stored credentials at startup and signal connection task
-    if let Some(creds) = read_wifi_credentials(flash_storage) {
-        println!("[WiFi Config] Found stored credentials: SSID='{}'", creds.ssid.as_str());
-        // Update display SSID
-        update_ssid(&display_sender, creds.ssid.as_str());
-        // Signal connection task to use stored credentials
-        WIFI_RECONNECT.signal((creds.ssid, creds.password));
-    }
-    
+/// Receive commands from any source and drive the actuators.
+///
+/// The `select(receive, yield_now)` pattern keeps the executor cycling so
+/// radio coex events (WiFi / BLE) are serviced promptly.
+///
+/// A 500ms watchdog is implemented via `Instant`: if no command is received
+/// within 500ms, all motors are automatically stopped. This prevents motors
+/// from being stuck at a power level when the controller loses connectivity.
+async fn command_loop(
+    servo: &mut ServoController<'_>,
+    motors: &mut [BrushlessMotor<'_>; 4],
+    display_sender: &DisplaySender,
+) -> ! {
+    let mut last_powers = [0i8; 4];
+    let mut last_cmd_time = Instant::now();
+
     loop {
-        // Wait for WiFi credentials from BLE
-        let (ssid, password) = BLE_WIFI_CREDENTIALS.wait().await;
-        println!("[WiFi Config] Received WiFi credentials via BLE: SSID='{}'", ssid.as_str());
-        
-        // Save to flash
-        match write_wifi_credentials(flash_storage, ssid.as_str(), password.as_str()) {
-            Ok(()) => {
-                println!("[WiFi Config] Credentials saved successfully: SSID='{}'", ssid.as_str());
-                // Update display SSID
-                update_ssid(&display_sender, ssid.as_str());
-                set_line1_override(&display_sender, "WiFi Saved!");
-                // Signal connection task to reconnect with new credentials
-                WIFI_RECONNECT.signal((ssid, password));
-            }
-            Err(e) => {
-                println!("[WiFi Config] Failed to save credentials for SSID='{}': {}", ssid.as_str(), e);
-                set_line1_override(&display_sender, "Save Failed!");
-            }
-        }
-    }
-}
-
-#[embassy_executor::task]
-async fn wifi_ready_task(
-    spawner: Spawner, 
-    stack: embassy_net::Stack<'static>,
-    display_sender: DisplaySender,
-) {
-    // Wait for link to be up
-    let mut period_count: u8 = 0;
-    loop {
-        if stack.is_link_up() {
-            break;
-        }
-        period_count = (period_count + 1) % 4;
-        update_dots(&display_sender, period_count);
-        match period_count {
-            0 => println!("Waiting for link"),
-            1 => println!("Waiting for link."),
-            2 => println!("Waiting for link.."),
-            _ => println!("Waiting for link..."),
-        }
-        Timer::after(Duration::from_millis(1000)).await;
-    }
-
-    println!("Waiting to get IP address...");
-    update_status(&display_sender, WifiStatus::GettingIP);
-    period_count = 0;
-    loop {
-        if let Some(config) = stack.config_v4() {
-            println!("Got IP: {}", config.address);
-            // Update display with IP address
-            let ip = config.address.address();
-            update_ip(&display_sender, ip.octets());
-            break;
-        }
-        period_count = (period_count + 1) % 4;
-        update_dots(&display_sender, period_count);
-        match period_count {
-            0 => println!("Getting IP"),
-            1 => println!("Getting IP."),
-            2 => println!("Getting IP.."),
-            _ => println!("Getting IP..."),
-        }
-        Timer::after(Duration::from_millis(1000)).await;
-    }
-
-    println!("WiFi connected successfully!");
-
-    // Spawn HTTP server once WiFi is ready
-    spawner.spawn(http_server_task(stack)).ok();
-}
-
-#[embassy_executor::task]
-async fn connection(mut controller: WifiController<'static>, display_sender: DisplaySender) {
-    println!("Start connection task");
-    println!("Device capabilities: {:?}", controller.capabilities());
-    
-    // Current credentials - start with compile-time defaults
-    let mut current_ssid: heapless::String<MAX_SSID_LEN> = heapless::String::try_from(SSID).unwrap_or_default();
-    let mut current_password: heapless::String<MAX_PASSWORD_LEN> = heapless::String::try_from(PASSWORD).unwrap_or_default();
-    
-    // Flag to track if we need to reconfigure
-    let mut needs_reconfigure = true;
-    
-    loop {
-        // Check if new credentials are available (non-blocking check)
-        if WIFI_RECONNECT.signaled() {
-            let (new_ssid, new_password) = WIFI_RECONNECT.wait().await;
-            println!("[WiFi] New credentials received: SSID='{}'", new_ssid.as_str());
-            
-            // Only reconnect if credentials actually changed
-            if new_ssid.as_str() != current_ssid.as_str() || new_password.as_str() != current_password.as_str() {
-                current_ssid = new_ssid;
-                current_password = new_password;
-                needs_reconfigure = true;
-                
-                // Disconnect if currently connected
-                if matches!(sta_state(), WifiStaState::Connected) {
-                    println!("[WiFi] Disconnecting to switch networks...");
-                    let _ = controller.disconnect_async().await;
-                    Timer::after(Duration::from_millis(1000)).await;
-                }
-                
-                // Stop WiFi to reconfigure
-                if matches!(controller.is_started(), Ok(true)) {
-                    println!("[WiFi] Stopping WiFi for reconfiguration...");
-                    let _ = controller.stop_async().await;
-                    Timer::after(Duration::from_millis(500)).await;
-                }
-            }
-        }
-        
-        match sta_state() {
-            WifiStaState::Connected => {
-                // Wait until we're no longer connected OR new credentials arrive
-                match select(
-                    controller.wait_for_event(WifiEvent::StaDisconnected),
-                    WIFI_RECONNECT.wait(),
-                ).await {
-                    Either::First(_) => {
-                        println!("[WiFi] Disconnected from network");
-                        Timer::after(Duration::from_millis(5000)).await;
+        match select(COMMANDS.receive(), embassy_futures::yield_now()).await {
+            Either::First(cmd) => {
+                last_cmd_time = Instant::now();
+                match cmd {
+                    Command::Servo(angle) => {
+                        servo.set_angle(angle);
+                        println!("Servo moved to {} degrees", angle);
                     }
-                    Either::Second((new_ssid, new_password)) => {
-                        println!("[WiFi] New credentials while connected: SSID='{}'", new_ssid.as_str());
-                        if new_ssid.as_str() != current_ssid.as_str() || new_password.as_str() != current_password.as_str() {
-                            current_ssid = new_ssid;
-                            current_password = new_password;
-                            needs_reconfigure = true;
-                            
-                            println!("[WiFi] Disconnecting to switch networks...");
-                            let _ = controller.disconnect_async().await;
-                            Timer::after(Duration::from_millis(1000)).await;
-                            
-                            if matches!(controller.is_started(), Ok(true)) {
-                                let _ = controller.stop_async().await;
-                                Timer::after(Duration::from_millis(500)).await;
-                            }
-                        }
+                    Command::Motor(id, power) => {
+                        let idx = id as usize;
+                        motors[idx].set_power(power);
+                        update_motor(display_sender, idx, power);
+                        last_powers[idx] = power;
+                        println!("Motor {:?} set to {}%", id, power);
+                    }
+                    Command::MotorsAll([a, b, c, d]) => {
+                        motors[0].set_power(a);
+                        motors[1].set_power(b);
+                        motors[2].set_power(c);
+                        motors[3].set_power(d);
+                        update_motor(display_sender, 0, a);
+                        update_motor(display_sender, 1, b);
+                        update_motor(display_sender, 2, c);
+                        update_motor(display_sender, 3, d);
+                        last_powers = [a, b, c, d];
+                        println!("Motors set to A={}% B={}% C={}% D={}%", a, b, c, d);
                     }
                 }
             }
-            _ => {}
-        }
-        
-        if needs_reconfigure || !matches!(controller.is_started(), Ok(true)) {
-            let client_config = ModeConfig::Client(
-                ClientConfig::default()
-                    .with_ssid(current_ssid.as_str().try_into().unwrap())
-                    .with_password(current_password.as_str().try_into().unwrap()),
-            );
-            controller.set_config(&client_config).unwrap();
-            needs_reconfigure = false;
-            println!("Starting WiFi...");
-            controller.start_async().await.unwrap();
-            println!("WiFi started!");
-        }
-        
-        println!("Connecting to WiFi network: {}", current_ssid.as_str());
-        
-        // Animate "Connecting" message with 0-3 periods while waiting
-        let mut connect_future = pin!(controller.connect_async());
-        let mut period_count: u8 = 0;
-        let mut new_creds_arrived = false;
-        
-        let result = loop {
-            match select(
-                &mut connect_future,
-                Timer::after(Duration::from_millis(1000)),
-            ).await {
-                Either::First(result) => break Some(result),
-                Either::Second(_) => {
-                    // Also check for new credentials during connection attempt
-                    if WIFI_RECONNECT.signaled() {
-                        println!("[WiFi] New credentials during connection, will restart");
-                        new_creds_arrived = true;
-                        break None;
+            Either::Second(_) => {
+                // Watchdog: no command for 500ms — stop motors if any are active
+                if last_powers.iter().any(|&p| p != 0)
+                    && last_cmd_time.elapsed() >= Duration::from_millis(500)
+                {
+                    println!("Watchdog: stopping all motors (no command for 500ms)");
+                    for (i, m) in motors.iter_mut().enumerate() {
+                        m.set_power(0);
+                        update_motor(display_sender, i, 0);
                     }
-                    period_count = (period_count + 1) % 4;
-                    update_dots(&display_sender, period_count);
-                    match period_count {
-                        0 => println!("Connecting"),
-                        1 => println!("Connecting."),
-                        2 => println!("Connecting.."),
-                        _ => println!("Connecting..."),
-                    }
+                    last_powers = [0; 4];
                 }
-            }
-        };
-        
-        if new_creds_arrived {
-            // Abort connection and loop back to pick up new credentials
-            continue;
-        }
-        
-        match result {
-            Some(Ok(_)) => println!("WiFi connected!"),
-            Some(Err(e)) => {
-                println!("Failed to connect to WiFi: {:?}", e);
-                Timer::after(Duration::from_millis(5000)).await
-            }
-            None => {
-                // Connection aborted due to new credentials
             }
         }
     }
-}
-
-#[embassy_executor::task]
-async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
-    runner.run().await
 }

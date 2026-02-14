@@ -2,8 +2,7 @@ use embassy_net::tcp::TcpSocket;
 use embassy_net::Stack;
 use embassy_time::Duration;
 use esp_println::println;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::signal::Signal;
+use crate::commands::{Command, MotorId, send_command};
 
 /// Buffer sizes for HTTP server
 const RX_BUFFER_SIZE: usize = 1024;
@@ -11,21 +10,6 @@ const TX_BUFFER_SIZE: usize = 4096;
 
 /// The controller HTML page, included at compile time
 const CONTROLLER_HTML: &str = include_str!("../controller.html");
-
-/// Signal for servo angle updates
-pub static SERVO_ANGLE: Signal<CriticalSectionRawMutex, u8> = Signal::new();
-
-/// Signal for motor A power updates (-100 to +100)
-pub static MOTOR_A_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
-
-/// Signal for motor B power updates (-100 to +100)
-pub static MOTOR_B_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
-
-/// Signal for motor C power updates (-100 to +100)
-pub static MOTOR_C_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
-
-/// Signal for motor D power updates (-100 to +100)
-pub static MOTOR_D_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
 
 /// Simple HTTP response builder
 fn build_response(status: &str, content_type: &str, body: &str) -> alloc::string::String {
@@ -168,10 +152,12 @@ fn handle_request(request: &str) -> HttpResponse {
                 HttpResponse::Small(build_response("200 OK", "application/json", body))
             } else if path.starts_with("/motors?") {
                 if let Some((a, b, c, d)) = parse_motors_batch(path) {
-                    if let Some(p) = a { MOTOR_A_POWER.signal(p); }
-                    if let Some(p) = b { MOTOR_B_POWER.signal(p); }
-                    if let Some(p) = c { MOTOR_C_POWER.signal(p); }
-                    if let Some(p) = d { MOTOR_D_POWER.signal(p); }
+                    send_command(Command::MotorsAll([
+                        a.unwrap_or(0),
+                        b.unwrap_or(0),
+                        c.unwrap_or(0),
+                        d.unwrap_or(0),
+                    ]));
                     let body = alloc::format!(
                         r#"{{"a":{},"b":{},"c":{},"d":{}}}"#,
                         a.map_or("null".into(), |v| alloc::format!("{}", v)),
@@ -187,13 +173,14 @@ fn handle_request(request: &str) -> HttpResponse {
             } else if path.starts_with("/motor/") {
                 if let Some((motor_id, power)) = parse_motor_power(path) {
                     if power >= -100 && power <= 100 {
-                        match motor_id {
-                            'a' => MOTOR_A_POWER.signal(power),
-                            'b' => MOTOR_B_POWER.signal(power),
-                            'c' => MOTOR_C_POWER.signal(power),
-                            'd' => MOTOR_D_POWER.signal(power),
+                        let id = match motor_id {
+                            'a' => MotorId::A,
+                            'b' => MotorId::B,
+                            'c' => MotorId::C,
+                            'd' => MotorId::D,
                             _ => unreachable!(),
-                        }
+                        };
+                        send_command(Command::Motor(id, power));
                         let body = alloc::format!(r#"{{"motor": "{}", "power": {}}}"#, motor_id, power);
                         HttpResponse::Small(build_response("200 OK", "application/json", &body))
                     } else {
@@ -207,7 +194,7 @@ fn handle_request(request: &str) -> HttpResponse {
             } else if path.starts_with("/servo") {
                 if let Some(angle) = parse_servo_angle(path) {
                     if angle <= 180 {
-                        SERVO_ANGLE.signal(angle);
+                        send_command(Command::Servo(angle));
                         let body = alloc::format!(r#"{{"angle": {}}}"#, angle);
                         HttpResponse::Small(build_response("200 OK", "application/json", &body))
                     } else {
@@ -238,7 +225,7 @@ pub async fn http_server_task(stack: Stack<'static>) {
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-        socket.set_timeout(Some(Duration::from_secs(10)));
+        socket.set_timeout(Some(Duration::from_secs(2)));
 
         println!("HTTP server listening on port 80...");
 

@@ -2,23 +2,7 @@ use esp_println::println;
 use esp_hal::uart::Uart;
 use esp_hal::Blocking;
 use embassy_time::{Duration, Timer};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::signal::Signal;
-
-/// Signal for servo angle updates from serial
-pub static SERIAL_SERVO_ANGLE: Signal<CriticalSectionRawMutex, u8> = Signal::new();
-
-/// Signal for motor A power updates from serial
-pub static SERIAL_MOTOR_A_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
-
-/// Signal for motor B power updates from serial
-pub static SERIAL_MOTOR_B_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
-
-/// Signal for motor C power updates from serial
-pub static SERIAL_MOTOR_C_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
-
-/// Signal for motor D power updates from serial
-pub static SERIAL_MOTOR_D_POWER: Signal<CriticalSectionRawMutex, i8> = Signal::new();
+use crate::commands::{Command, MotorId, send_command};
 
 /// Parsed command from serial input
 enum SerialCommand {
@@ -151,30 +135,27 @@ pub async fn serial_input_task(mut uart: Uart<'static, Blocking>) {
                                 match parse_command(cmd) {
                                     Some(SerialCommand::Servo(angle)) => {
                                         println!("\nSerial: Setting servo to {} degrees", angle);
-                                        SERIAL_SERVO_ANGLE.signal(angle);
+                                        send_command(Command::Servo(angle));
                                     }
                                     Some(SerialCommand::MotorA(power)) => {
                                         println!("\nSerial: Setting motor A to {}%", power);
-                                        SERIAL_MOTOR_A_POWER.signal(power);
+                                        send_command(Command::Motor(MotorId::A, power));
                                     }
                                     Some(SerialCommand::MotorB(power)) => {
                                         println!("\nSerial: Setting motor B to {}%", power);
-                                        SERIAL_MOTOR_B_POWER.signal(power);
+                                        send_command(Command::Motor(MotorId::B, power));
                                     }
                                     Some(SerialCommand::MotorC(power)) => {
                                         println!("\nSerial: Setting motor C to {}%", power);
-                                        SERIAL_MOTOR_C_POWER.signal(power);
+                                        send_command(Command::Motor(MotorId::C, power));
                                     }
                                     Some(SerialCommand::MotorD(power)) => {
                                         println!("\nSerial: Setting motor D to {}%", power);
-                                        SERIAL_MOTOR_D_POWER.signal(power);
+                                        send_command(Command::Motor(MotorId::D, power));
                                     }
                                     Some(SerialCommand::MotorAll(power)) => {
                                         println!("\nSerial: Setting all motors to {}%", power);
-                                        SERIAL_MOTOR_A_POWER.signal(power);
-                                        SERIAL_MOTOR_B_POWER.signal(power);
-                                        SERIAL_MOTOR_C_POWER.signal(power);
-                                        SERIAL_MOTOR_D_POWER.signal(power);
+                                        send_command(Command::MotorsAll([power; 4]));
                                     }
                                     None => {
                                         if !cmd.trim().is_empty() {

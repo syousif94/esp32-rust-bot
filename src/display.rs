@@ -126,6 +126,21 @@ pub fn update_motor_d(sender: &DisplaySender, power: i8) {
     });
 }
 
+/// Update a motor's power by index (0=A, 1=B, 2=C, 3=D)
+pub fn update_motor(sender: &DisplaySender, index: usize, power: i8) {
+    sender.send_modify(|state| {
+        if let Some(s) = state {
+            match index {
+                0 => s.motor_a = power,
+                1 => s.motor_b = power,
+                2 => s.motor_c = power,
+                3 => s.motor_d = power,
+                _ => {}
+            }
+        }
+    });
+}
+
 /// Update IP address in display state
 pub fn update_ip(sender: &DisplaySender, ip: [u8; 4]) {
     sender.send_modify(|state| {

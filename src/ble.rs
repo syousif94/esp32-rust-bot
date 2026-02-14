@@ -13,18 +13,13 @@ use esp_radio::ble::controller::BleConnector;
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
 use crate::wifi_config::{MAX_SSID_LEN, MAX_PASSWORD_LEN};
+use crate::commands::{Command, send_command};
 
 /// Max number of BLE connections (1 is typical for a peripheral)
 const CONNECTIONS_MAX: usize = 1;
 
 /// Max number of L2CAP channels (Signal + ATT)
 const L2CAP_CHANNELS_MAX: usize = 2;
-
-/// Signal for servo angle updates from BLE
-pub static BLE_SERVO_ANGLE: Signal<CriticalSectionRawMutex, u8> = Signal::new();
-
-/// Signal for all motors at once from BLE (a, b, c, d) — each -100 to +100
-pub static BLE_MOTORS_ALL: Signal<CriticalSectionRawMutex, [i8; 4]> = Signal::new();
 
 /// WiFi credentials received via BLE (SSID, password as heapless strings)
 pub type WifiCredentialsData = (heapless::String<MAX_SSID_LEN>, heapless::String<MAX_PASSWORD_LEN>);
@@ -90,7 +85,7 @@ async fn gatt_events_task<P: PacketPool>(
                             if let Some(&val) = data.first() {
                                 if val <= 180 {
                                     println!("[BLE] Servo angle set to {}", val);
-                                    BLE_SERVO_ANGLE.signal(val);
+                                    send_command(Command::Servo(val));
                                 } else {
                                     println!("[BLE] Servo angle {} out of range (0-180)", val);
                                 }
@@ -102,7 +97,7 @@ async fn gatt_events_task<P: PacketPool>(
                                 let c = data[2] as i8;
                                 let d = data[3] as i8;
                                 println!("[BLE] Motors: A={}% B={}% C={}% D={}%", a, b, c, d);
-                                BLE_MOTORS_ALL.signal([a, b, c, d]);
+                                send_command(Command::MotorsAll([a, b, c, d]));
                             } else {
                                 println!("[BLE] motors: expected 4 bytes, got {}", data.len());
                             }
