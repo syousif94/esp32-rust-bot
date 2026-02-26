@@ -11,6 +11,7 @@ use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
+    gpio::{Level, Output, OutputConfig},
     i2c::master::{Config as I2cConfig, I2c},
     ledc::Ledc,
     rng::Rng,
@@ -78,16 +79,31 @@ async fn main(spawner: Spawner) -> ! {
         esp_hal::ledc::timer::Timer<'static, esp_hal::ledc::HighSpeed>,
         init_motor_timer(ledc)
     );
+    // Pre-configure all motor pins as output low to prevent them being high on startup
+    let gpio32 = Output::new(peripherals.GPIO32, Level::Low, OutputConfig::default());
+    let gpio33 = Output::new(peripherals.GPIO33, Level::Low, OutputConfig::default());
+    let gpio25 = Output::new(peripherals.GPIO25, Level::Low, OutputConfig::default());
+    let gpio26 = Output::new(peripherals.GPIO26, Level::Low, OutputConfig::default());
+    let gpio19 = Output::new(peripherals.GPIO19, Level::Low, OutputConfig::default());
+    let gpio21 = Output::new(peripherals.GPIO21, Level::Low, OutputConfig::default());
+    let gpio22 = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());
+    let gpio23 = Output::new(peripherals.GPIO23, Level::Low, OutputConfig::default());
+
     let mut motors = [
-        BrushlessMotor::new(motor_timer, peripherals.GPIO32, peripherals.GPIO33,
+        BrushlessMotor::new(motor_timer, gpio32, gpio33,
             esp_hal::ledc::channel::Number::Channel1, esp_hal::ledc::channel::Number::Channel2, "Motor A"),
-        BrushlessMotor::new(motor_timer, peripherals.GPIO25, peripherals.GPIO26,
+        BrushlessMotor::new(motor_timer, gpio25, gpio26,
             esp_hal::ledc::channel::Number::Channel3, esp_hal::ledc::channel::Number::Channel4, "Motor B"),
-        BrushlessMotor::new(motor_timer, peripherals.GPIO19, peripherals.GPIO21,
+        BrushlessMotor::new(motor_timer, gpio19, gpio21,
             esp_hal::ledc::channel::Number::Channel5, esp_hal::ledc::channel::Number::Channel6, "Motor C"),
-        BrushlessMotor::new(motor_timer, peripherals.GPIO22, peripherals.GPIO23,
+        BrushlessMotor::new(motor_timer, gpio22, gpio23,
             esp_hal::ledc::channel::Number::Channel7, esp_hal::ledc::channel::Number::Channel0, "Motor D"),
     ];
+
+    // Ensure all motors are stopped after initialization
+    for motor in motors.iter_mut() {
+        motor.set_power(0);
+    }
 
     // -- I2C / OLED display ---------------------------------------------
     let i2c = I2c::new(

@@ -215,7 +215,7 @@
         dot.style.top = `calc(50% + ${dy}px)`;
 
         const nx = dx / radius;
-        const ny = -dy / radius;
+        const ny = dy / radius;
 
         currentLeft = clamp(Math.round((ny + nx) * 100), -100, 100);
         currentRight = clamp(Math.round((ny - nx) * 100), -100, 100);
