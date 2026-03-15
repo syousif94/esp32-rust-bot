@@ -2,7 +2,7 @@ use embassy_net::tcp::TcpSocket;
 use embassy_net::Stack;
 use embassy_time::Duration;
 use esp_println::println;
-use crate::commands::{Command, MotorId, send_command};
+use crate::commands::{Command, MotorId, send_command, MOTOR_COUNT};
 
 /// Buffer sizes for HTTP server
 const RX_BUFFER_SIZE: usize = 1024;
@@ -57,7 +57,7 @@ fn parse_motor_power(path: &str) -> Option<(char, i8)> {
     if let Some(rest) = path.strip_prefix("/motor/") {
         let mut parts = rest.split('/');
         let motor_id = parts.next()?.chars().next()?;
-        if motor_id != 'a' && motor_id != 'b' && motor_id != 'c' && motor_id != 'd' {
+        if !is_valid_motor_id(motor_id) {
             return None;
         }
         if let Some(power_str) = parts.next() {
@@ -70,7 +70,7 @@ fn parse_motor_power(path: &str) -> Option<(char, i8)> {
     if path.starts_with("/motor/") {
         let rest = path.strip_prefix("/motor/")?;
         let motor_id = rest.chars().next()?;
-        if motor_id != 'a' && motor_id != 'b' && motor_id != 'c' && motor_id != 'd' {
+        if !is_valid_motor_id(motor_id) {
             return None;
         }
         if rest.contains('?') {
@@ -86,35 +86,46 @@ fn parse_motor_power(path: &str) -> Option<(char, i8)> {
     None
 }
 
+/// Check whether a motor id char is valid for this build
+fn is_valid_motor_id(c: char) -> bool {
+    match c {
+        'a' | 'b' => true,
+        #[cfg(feature = "four_motor")]
+        'c' | 'd' => true,
+        _ => false,
+    }
+}
+
 /// Parse batch motor powers from query string like /motors?a=50&b=-30&c=50&d=-30
 /// Returns (Option<i8>, Option<i8>, Option<i8>, Option<i8>) for motors A, B, C, D
-fn parse_motors_batch(path: &str) -> Option<(Option<i8>, Option<i8>, Option<i8>, Option<i8>)> {
+fn parse_motors_batch(path: &str) -> Option<[Option<i8>; MOTOR_COUNT]> {
     let query = path.split('?').nth(1)?;
-    let mut a: Option<i8> = None;
-    let mut b: Option<i8> = None;
-    let mut c: Option<i8> = None;
-    let mut d: Option<i8> = None;
+    let mut result = [None::<i8>; MOTOR_COUNT];
     let mut found_any = false;
     for part in query.split('&') {
         if let Some(val) = part.strip_prefix("a=") {
             if let Ok(p) = val.parse::<i8>() {
-                if p >= -100 && p <= 100 { a = Some(p); found_any = true; }
+                if p >= -100 && p <= 100 { result[0] = Some(p); found_any = true; }
             }
         } else if let Some(val) = part.strip_prefix("b=") {
             if let Ok(p) = val.parse::<i8>() {
-                if p >= -100 && p <= 100 { b = Some(p); found_any = true; }
+                if p >= -100 && p <= 100 { result[1] = Some(p); found_any = true; }
             }
-        } else if let Some(val) = part.strip_prefix("c=") {
-            if let Ok(p) = val.parse::<i8>() {
-                if p >= -100 && p <= 100 { c = Some(p); found_any = true; }
-            }
-        } else if let Some(val) = part.strip_prefix("d=") {
-            if let Ok(p) = val.parse::<i8>() {
-                if p >= -100 && p <= 100 { d = Some(p); found_any = true; }
+        }
+        #[cfg(feature = "four_motor")]
+        {
+            if let Some(val) = part.strip_prefix("c=") {
+                if let Ok(p) = val.parse::<i8>() {
+                    if p >= -100 && p <= 100 { result[2] = Some(p); found_any = true; }
+                }
+            } else if let Some(val) = part.strip_prefix("d=") {
+                if let Ok(p) = val.parse::<i8>() {
+                    if p >= -100 && p <= 100 { result[3] = Some(p); found_any = true; }
+                }
             }
         }
     }
-    if found_any { Some((a, b, c, d)) } else { None }
+    if found_any { Some(result) } else { None }
 }
 
 /// Response type to avoid allocating the large HTML page on heap
@@ -150,20 +161,32 @@ fn handle_request(request: &str) -> HttpResponse {
             } else if path == "/health" {
                 let body = r#"{"healthy": true}"#;
                 HttpResponse::Small(build_response("200 OK", "application/json", body))
+            } else if path == "/config" {
+                #[cfg(feature = "four_motor")]
+                let body = r#"{"motor_mode":"four_motor","motor_count":4,"motors":["a","b","c","d"]}"#;
+                #[cfg(feature = "two_motor")]
+                let body = r#"{"motor_mode":"two_motor","motor_count":2,"motors":["a","b"]}"#;
+                HttpResponse::Small(build_response("200 OK", "application/json", body))
             } else if path.starts_with("/motors?") {
-                if let Some((a, b, c, d)) = parse_motors_batch(path) {
-                    send_command(Command::MotorsAll([
-                        a.unwrap_or(0),
-                        b.unwrap_or(0),
-                        c.unwrap_or(0),
-                        d.unwrap_or(0),
-                    ]));
+                if let Some(parsed) = parse_motors_batch(path) {
+                    let mut powers = [0i8; MOTOR_COUNT];
+                    for (i, opt) in parsed.iter().enumerate() {
+                        powers[i] = opt.unwrap_or(0);
+                    }
+                    send_command(Command::MotorsAll(powers));
+                    #[cfg(feature = "four_motor")]
                     let body = alloc::format!(
                         r#"{{"a":{},"b":{},"c":{},"d":{}}}"#,
-                        a.map_or("null".into(), |v| alloc::format!("{}", v)),
-                        b.map_or("null".into(), |v| alloc::format!("{}", v)),
-                        c.map_or("null".into(), |v| alloc::format!("{}", v)),
-                        d.map_or("null".into(), |v| alloc::format!("{}", v)),
+                        parsed[0].map_or("null".into(), |v| alloc::format!("{}", v)),
+                        parsed[1].map_or("null".into(), |v| alloc::format!("{}", v)),
+                        parsed[2].map_or("null".into(), |v| alloc::format!("{}", v)),
+                        parsed[3].map_or("null".into(), |v| alloc::format!("{}", v)),
+                    );
+                    #[cfg(feature = "two_motor")]
+                    let body = alloc::format!(
+                        r#"{{"a":{},"b":{}}}"#,
+                        parsed[0].map_or("null".into(), |v| alloc::format!("{}", v)),
+                        parsed[1].map_or("null".into(), |v| alloc::format!("{}", v)),
                     );
                     HttpResponse::Small(build_response("200 OK", "application/json", &body))
                 } else {
@@ -176,7 +199,9 @@ fn handle_request(request: &str) -> HttpResponse {
                         let id = match motor_id {
                             'a' => MotorId::A,
                             'b' => MotorId::B,
+                            #[cfg(feature = "four_motor")]
                             'c' => MotorId::C,
+                            #[cfg(feature = "four_motor")]
                             'd' => MotorId::D,
                             _ => unreachable!(),
                         };

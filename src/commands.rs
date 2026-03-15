@@ -6,12 +6,20 @@
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 
+/// Number of motors in this build configuration
+#[cfg(feature = "four_motor")]
+pub const MOTOR_COUNT: usize = 4;
+#[cfg(feature = "two_motor")]
+pub const MOTOR_COUNT: usize = 2;
+
 /// Motor identifier
 #[derive(Debug, Clone, Copy)]
 pub enum MotorId {
     A = 0,
     B = 1,
+    #[cfg(feature = "four_motor")]
     C = 2,
+    #[cfg(feature = "four_motor")]
     D = 3,
 }
 
@@ -22,8 +30,8 @@ pub enum Command {
     Servo(u8),
     /// Set a single motor's power (–100 to +100)
     Motor(MotorId, i8),
-    /// Set all four motors at once \[A, B, C, D\]
-    MotorsAll([i8; 4]),
+    /// Set all motors at once
+    MotorsAll([i8; MOTOR_COUNT]),
 }
 
 /// Global command channel — all input tasks send here, main loop receives.

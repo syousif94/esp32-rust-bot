@@ -24,8 +24,12 @@ use esp_radio::ble::controller::BleConnector;
 use esp_storage::FlashStorage;
 use static_cell::StaticCell;
 
-use esp32_http_servo::brushless::{init_motor_timer, BrushlessMotor};
-use esp32_http_servo::commands::{Command, COMMANDS};
+use esp32_http_servo::brushless::{init_motor_timer, MotorControl};
+#[cfg(feature = "four_motor")]
+use esp32_http_servo::brushless::BrushlessMotor;
+#[cfg(feature = "two_motor")]
+use esp32_http_servo::brushless::TB6612Motor;
+use esp32_http_servo::commands::{Command, COMMANDS, MOTOR_COUNT};
 use esp32_http_servo::display::{display_task, init_display_state, update_motor, DisplaySender};
 use esp32_http_servo::servo::{init_servo_timer, ServoController};
 
@@ -79,41 +83,83 @@ async fn main(spawner: Spawner) -> ! {
         esp_hal::ledc::timer::Timer<'static, esp_hal::ledc::HighSpeed>,
         init_motor_timer(ledc)
     );
-    // Pre-configure all motor pins as output low to prevent them being high on startup
-    let gpio32 = Output::new(peripherals.GPIO32, Level::Low, OutputConfig::default());
-    let gpio33 = Output::new(peripherals.GPIO33, Level::Low, OutputConfig::default());
-    let gpio25 = Output::new(peripherals.GPIO25, Level::Low, OutputConfig::default());
-    let gpio26 = Output::new(peripherals.GPIO26, Level::Low, OutputConfig::default());
-    let gpio19 = Output::new(peripherals.GPIO19, Level::Low, OutputConfig::default());
-    let gpio21 = Output::new(peripherals.GPIO21, Level::Low, OutputConfig::default());
-    let gpio22 = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());
-    let gpio23 = Output::new(peripherals.GPIO23, Level::Low, OutputConfig::default());
+    // -- Motor pin setup (conditional on feature) ----------------------
+    #[cfg(feature = "four_motor")]
+    let mut motors = {
+        // Pre-configure all motor pins as output low to prevent them being high on startup
+        let gpio32 = Output::new(peripherals.GPIO32, Level::Low, OutputConfig::default());
+        let gpio33 = Output::new(peripherals.GPIO33, Level::Low, OutputConfig::default());
+        let gpio25 = Output::new(peripherals.GPIO25, Level::Low, OutputConfig::default());
+        let gpio26 = Output::new(peripherals.GPIO26, Level::Low, OutputConfig::default());
+        let gpio19 = Output::new(peripherals.GPIO19, Level::Low, OutputConfig::default());
+        let gpio21 = Output::new(peripherals.GPIO21, Level::Low, OutputConfig::default());
+        let gpio22 = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());
+        let gpio23 = Output::new(peripherals.GPIO23, Level::Low, OutputConfig::default());
 
-    let mut motors = [
-        BrushlessMotor::new(motor_timer, gpio32, gpio33,
-            esp_hal::ledc::channel::Number::Channel1, esp_hal::ledc::channel::Number::Channel2, "Motor A"),
-        BrushlessMotor::new(motor_timer, gpio25, gpio26,
-            esp_hal::ledc::channel::Number::Channel3, esp_hal::ledc::channel::Number::Channel4, "Motor B"),
-        BrushlessMotor::new(motor_timer, gpio19, gpio21,
-            esp_hal::ledc::channel::Number::Channel5, esp_hal::ledc::channel::Number::Channel6, "Motor C"),
-        BrushlessMotor::new(motor_timer, gpio22, gpio23,
-            esp_hal::ledc::channel::Number::Channel7, esp_hal::ledc::channel::Number::Channel0, "Motor D"),
-    ];
+        let mut m: [BrushlessMotor; 4] = [
+            BrushlessMotor::new(motor_timer, gpio32, gpio33,
+                esp_hal::ledc::channel::Number::Channel1, esp_hal::ledc::channel::Number::Channel2, "Motor A"),
+            BrushlessMotor::new(motor_timer, gpio25, gpio26,
+                esp_hal::ledc::channel::Number::Channel3, esp_hal::ledc::channel::Number::Channel4, "Motor B"),
+            BrushlessMotor::new(motor_timer, gpio19, gpio21,
+                esp_hal::ledc::channel::Number::Channel5, esp_hal::ledc::channel::Number::Channel6, "Motor C"),
+            BrushlessMotor::new(motor_timer, gpio22, gpio23,
+                esp_hal::ledc::channel::Number::Channel7, esp_hal::ledc::channel::Number::Channel0, "Motor D"),
+        ];
+        for motor in m.iter_mut() { motor.set_power(0); }
+        m
+    };
 
-    // Ensure all motors are stopped after initialization
-    for motor in motors.iter_mut() {
-        motor.set_power(0);
-    }
+    #[cfg(feature = "two_motor")]
+    let mut motors = {
+        // TB6612 2-motor configuration (STBY is hardwired to 3.3V)
+        // Pin mapping from schematic: S0=GPIO25(PWMA), S1=GPIO17(AIN2),
+        // S2=GPIO21(AIN1), S3=GPIO22(BIN1), S4=GPIO23(BIN2), S5=GPIO26(PWMB)
+
+        // Motor A: AIN1 = GPIO21, AIN2 = GPIO17, PWMA = GPIO25
+        let ain1 = Output::new(peripherals.GPIO21, Level::Low, OutputConfig::default());
+        let ain2 = Output::new(peripherals.GPIO17, Level::Low, OutputConfig::default());
+        // Motor B: BIN1 = GPIO22, BIN2 = GPIO23, PWMB = GPIO26
+        let bin1 = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());
+        let bin2 = Output::new(peripherals.GPIO23, Level::Low, OutputConfig::default());
+
+        let mut m: [TB6612Motor; 2] = [
+            TB6612Motor::new(motor_timer, ain1, ain2, peripherals.GPIO25,
+                esp_hal::ledc::channel::Number::Channel1, "Motor A"),
+            TB6612Motor::new(motor_timer, bin1, bin2, peripherals.GPIO26,
+                esp_hal::ledc::channel::Number::Channel2, "Motor B"),
+        ];
+        for motor in m.iter_mut() { motor.set_power(0); }
+        println!("TB6612 2-motor config: STBY=3.3V (always on), PWMA=GPIO25, PWMB=GPIO26");
+        m
+    };
 
     // -- I2C / OLED display ---------------------------------------------
-    let i2c = I2c::new(
-        peripherals.I2C0,
-        I2cConfig::default().with_frequency(Rate::from_khz(100)),
-    )
-    .unwrap()
-    .with_sda(peripherals.GPIO4)
-    .with_scl(peripherals.GPIO5);
-    println!("I2C initialized on GPIO5 (SDA) / GPIO4 (SCL) at 100kHz");
+    #[cfg(feature = "four_motor")]
+    let i2c = {
+        let bus = I2c::new(
+            peripherals.I2C0,
+            I2cConfig::default().with_frequency(Rate::from_khz(100)),
+        )
+        .unwrap()
+        .with_sda(peripherals.GPIO4)
+        .with_scl(peripherals.GPIO5);
+        println!("I2C initialized on GPIO4 (SDA) / GPIO5 (SCL) at 100kHz");
+        bus
+    };
+
+    #[cfg(feature = "two_motor")]
+    let i2c = {
+        let bus = I2c::new(
+            peripherals.I2C0,
+            I2cConfig::default().with_frequency(Rate::from_khz(100)),
+        )
+        .unwrap()
+        .with_sda(peripherals.GPIO32)
+        .with_scl(peripherals.GPIO33);
+        println!("I2C initialized on GPIO32 (SDA) / GPIO33 (SCL) at 100kHz");
+        bus
+    };
 
     let display_sender = init_display_state(default_ssid());
     spawner.spawn(display_task(i2c)).ok();
@@ -162,7 +208,14 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(wifi_ready_task(spawner, stack, display_sender.clone())).ok();
 
     // -- Command loop ---------------------------------------------------
-    command_loop(&mut servo, &mut motors, &display_sender).await
+    #[cfg(feature = "four_motor")]
+    {
+        command_loop(&mut servo, &mut motors, &display_sender).await
+    }
+    #[cfg(feature = "two_motor")]
+    {
+        command_loop(&mut servo, &mut motors, &display_sender).await
+    }
 }
 
 /// Receive commands from any source and drive the actuators.
@@ -173,12 +226,12 @@ async fn main(spawner: Spawner) -> ! {
 /// A 500ms watchdog is implemented via `Instant`: if no command is received
 /// within 500ms, all motors are automatically stopped. This prevents motors
 /// from being stuck at a power level when the controller loses connectivity.
-async fn command_loop(
+async fn command_loop<M: MotorControl>(
     servo: &mut ServoController<'_>,
-    motors: &mut [BrushlessMotor<'_>; 4],
+    motors: &mut [M; MOTOR_COUNT],
     display_sender: &DisplaySender,
 ) -> ! {
-    let mut last_powers = [0i8; 4];
+    let mut last_powers = [0i8; MOTOR_COUNT];
     let mut last_cmd_time = Instant::now();
 
     loop {
@@ -197,17 +250,16 @@ async fn command_loop(
                         last_powers[idx] = power;
                         println!("Motor {:?} set to {}%", id, power);
                     }
-                    Command::MotorsAll([a, b, c, d]) => {
-                        motors[0].set_power(a);
-                        motors[1].set_power(b);
-                        motors[2].set_power(c);
-                        motors[3].set_power(d);
-                        update_motor(display_sender, 0, a);
-                        update_motor(display_sender, 1, b);
-                        update_motor(display_sender, 2, c);
-                        update_motor(display_sender, 3, d);
-                        last_powers = [a, b, c, d];
-                        println!("Motors set to A={}% B={}% C={}% D={}%", a, b, c, d);
+                    Command::MotorsAll(powers) => {
+                        for (i, &p) in powers.iter().enumerate() {
+                            motors[i].set_power(p);
+                            update_motor(display_sender, i, p);
+                        }
+                        last_powers = powers;
+                        #[cfg(feature = "four_motor")]
+                        println!("Motors set to A={}% B={}% C={}% D={}%", powers[0], powers[1], powers[2], powers[3]);
+                        #[cfg(feature = "two_motor")]
+                        println!("Motors set to A={}% B={}%", powers[0], powers[1]);
                     }
                 }
             }
@@ -221,7 +273,7 @@ async fn command_loop(
                         m.set_power(0);
                         update_motor(display_sender, i, 0);
                     }
-                    last_powers = [0; 4];
+                    last_powers = [0; MOTOR_COUNT];
                 }
             }
         }

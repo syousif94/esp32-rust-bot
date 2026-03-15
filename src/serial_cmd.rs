@@ -2,14 +2,16 @@ use esp_println::println;
 use esp_hal::uart::Uart;
 use esp_hal::Blocking;
 use embassy_time::{Duration, Timer};
-use crate::commands::{Command, MotorId, send_command};
+use crate::commands::{Command, MotorId, send_command, MOTOR_COUNT};
 
 /// Parsed command from serial input
 enum SerialCommand {
     Servo(u8),
     MotorA(i8),
     MotorB(i8),
+    #[cfg(feature = "four_motor")]
     MotorC(i8),
+    #[cfg(feature = "four_motor")]
     MotorD(i8),
     MotorAll(i8),
 }
@@ -56,7 +58,11 @@ fn parse_motor_command(input: &str) -> Option<(char, i8)> {
     }
     
     // Try "ma X", "mb X", "mc X", "md X" format
-    for (prefix, motor_id) in [("ma ", 'a'), ("mb ", 'b'), ("mc ", 'c'), ("md ", 'd')] {
+    #[cfg(feature = "four_motor")]
+    let motor_prefixes: &[(&str, char)] = &[("ma ", 'a'), ("mb ", 'b'), ("mc ", 'c'), ("md ", 'd')];
+    #[cfg(feature = "two_motor")]
+    let motor_prefixes: &[(&str, char)] = &[("ma ", 'a'), ("mb ", 'b')];
+    for &(prefix, motor_id) in motor_prefixes {
         if let Some(rest) = input.strip_prefix(prefix) {
             if let Ok(power) = rest.trim().parse::<i8>() {
                 if power >= -100 && power <= 100 {
@@ -69,7 +75,11 @@ fn parse_motor_command(input: &str) -> Option<(char, i8)> {
     // Try "motor a X", "motor b X", "motor c X", "motor d X" format
     if let Some(rest) = input.strip_prefix("motor ") {
         let rest = rest.trim();
-        for (prefix, motor_id) in [("a ", 'a'), ("b ", 'b'), ("c ", 'c'), ("d ", 'd')] {
+        #[cfg(feature = "four_motor")]
+        let motor_prefixes: &[(&str, char)] = &[("a ", 'a'), ("b ", 'b'), ("c ", 'c'), ("d ", 'd')];
+        #[cfg(feature = "two_motor")]
+        let motor_prefixes: &[(&str, char)] = &[("a ", 'a'), ("b ", 'b')];
+        for &(prefix, motor_id) in motor_prefixes {
             if let Some(power_str) = rest.strip_prefix(prefix) {
                 if let Ok(power) = power_str.trim().parse::<i8>() {
                     if power >= -100 && power <= 100 {
@@ -90,7 +100,9 @@ fn parse_command(input: &str) -> Option<SerialCommand> {
         return match motor {
             'a' => Some(SerialCommand::MotorA(power)),
             'b' => Some(SerialCommand::MotorB(power)),
+            #[cfg(feature = "four_motor")]
             'c' => Some(SerialCommand::MotorC(power)),
+            #[cfg(feature = "four_motor")]
             'd' => Some(SerialCommand::MotorD(power)),
             '*' => Some(SerialCommand::MotorAll(power)),
             _ => None,
@@ -110,8 +122,14 @@ fn parse_command(input: &str) -> Option<SerialCommand> {
 pub async fn serial_input_task(mut uart: Uart<'static, Blocking>) {
     println!("Serial command interface ready");
     println!("  Servo:  <angle> or 'servo <angle>' (0-180)");
+    #[cfg(feature = "four_motor")]
     println!("  Motor:  'm <power>' (all), 'ma/mb/mc/md <power>' (-100 to 100)");
+    #[cfg(feature = "two_motor")]
+    println!("  Motor:  'm <power>' (all), 'ma/mb <power>' (-100 to 100)");
+    #[cfg(feature = "four_motor")]
     println!("  Examples: 90, m 50, ma 75, mb -50, mc 100, md -25");
+    #[cfg(feature = "two_motor")]
+    println!("  Examples: 90, m 50, ma 75, mb -50");
     
     let mut buffer = [0u8; 64];
     let mut pos = 0usize;
@@ -145,17 +163,19 @@ pub async fn serial_input_task(mut uart: Uart<'static, Blocking>) {
                                         println!("\nSerial: Setting motor B to {}%", power);
                                         send_command(Command::Motor(MotorId::B, power));
                                     }
+                                    #[cfg(feature = "four_motor")]
                                     Some(SerialCommand::MotorC(power)) => {
                                         println!("\nSerial: Setting motor C to {}%", power);
                                         send_command(Command::Motor(MotorId::C, power));
                                     }
+                                    #[cfg(feature = "four_motor")]
                                     Some(SerialCommand::MotorD(power)) => {
                                         println!("\nSerial: Setting motor D to {}%", power);
                                         send_command(Command::Motor(MotorId::D, power));
                                     }
                                     Some(SerialCommand::MotorAll(power)) => {
                                         println!("\nSerial: Setting all motors to {}%", power);
-                                        send_command(Command::MotorsAll([power; 4]));
+                                        send_command(Command::MotorsAll([power; MOTOR_COUNT]));
                                     }
                                     None => {
                                         if !cmd.trim().is_empty() {

@@ -36,6 +36,11 @@ trouble-host = { version = "0.5.1", features = ["gatt"] }
 esp-storage = { version = "0.8.1", features = ["esp32"] }
 embedded-storage = "0.3.1"
 
+[features]
+default = ["two_motor"]
+four_motor = []
+two_motor = []
+
 [profile.dev]
 # Rust debug is too slow.
 # For debug builds always builds with some optimization

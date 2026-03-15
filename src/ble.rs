@@ -13,7 +13,7 @@ use esp_radio::ble::controller::BleConnector;
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
 use crate::wifi_config::{MAX_SSID_LEN, MAX_PASSWORD_LEN};
-use crate::commands::{Command, send_command};
+use crate::commands::{Command, send_command, MOTOR_COUNT};
 
 /// Max number of BLE connections (1 is typical for a peripheral)
 const CONNECTIONS_MAX: usize = 1;
@@ -34,6 +34,7 @@ pub static BLE_WIFI_CREDENTIALS: Signal<CriticalSectionRawMutex, WifiCredentials
 // Servo:       e3910002-4567-4321-abcd-abcdef012345
 // Motors (4B): e3910003-4567-4321-abcd-abcdef012345
 // WiFi Config: e3910004-4567-4321-abcd-abcdef012345 (write SSID + password)
+// Motor Count: e3910005-4567-4321-abcd-abcdef012345 (read-only, 1 byte: 2 or 4)
 
 /// GATT Server definition with our motor control service
 #[gatt_server]
@@ -50,6 +51,7 @@ struct MotorControlService {
     servo_angle: u8,
 
     /// All motors (4 bytes: A, B, C, D each -100..100), read + write + write_without_response + notify
+    /// For two_motor builds only bytes 0-1 are used.
     #[characteristic(uuid = "e3910003-4567-4321-abcd-abcdef012345", read, write, write_without_response, notify, value = [0, 0, 0, 0])]
     motors: [u8; 4],
 
@@ -57,6 +59,10 @@ struct MotorControlService {
     /// Max 97 bytes: 32 (SSID) + 1 (null) + 64 (password)
     #[characteristic(uuid = "e3910004-4567-4321-abcd-abcdef012345", write, value = [0u8; 97])]
     wifi_config: [u8; 97],
+
+    /// Motor count (read-only): returns the number of motors in this firmware build (2 or 4)
+    #[characteristic(uuid = "e3910005-4567-4321-abcd-abcdef012345", read, value = 0)]
+    motor_count: u8,
 }
 
 /// Run the BLE host stack background task
@@ -91,15 +97,18 @@ async fn gatt_events_task<P: PacketPool>(
                                 }
                             }
                         } else if handle == server.motor_control.motors.handle {
-                            if data.len() >= 4 {
-                                let a = data[0] as i8;
-                                let b = data[1] as i8;
-                                let c = data[2] as i8;
-                                let d = data[3] as i8;
-                                println!("[BLE] Motors: A={}% B={}% C={}% D={}%", a, b, c, d);
-                                send_command(Command::MotorsAll([a, b, c, d]));
+                            if data.len() >= MOTOR_COUNT {
+                                let mut powers = [0i8; MOTOR_COUNT];
+                                for i in 0..MOTOR_COUNT {
+                                    powers[i] = data[i] as i8;
+                                }
+                                #[cfg(feature = "four_motor")]
+                                println!("[BLE] Motors: A={}% B={}% C={}% D={}%", powers[0], powers[1], powers[2], powers[3]);
+                                #[cfg(feature = "two_motor")]
+                                println!("[BLE] Motors: A={}% B={}%", powers[0], powers[1]);
+                                send_command(Command::MotorsAll(powers));
                             } else {
-                                println!("[BLE] motors: expected 4 bytes, got {}", data.len());
+                                println!("[BLE] motors: expected {} bytes, got {}", MOTOR_COUNT, data.len());
                             }
                         } else if handle == server.motor_control.wifi_config.handle {
                             // WiFi config format: "SSID\0PASSWORD" (null-separated)
@@ -248,6 +257,10 @@ pub async fn ble_task(connector: BleConnector<'static>) {
     );
 
     println!("[BLE] GATT server started");
+
+    // Set motor_count characteristic to the actual MOTOR_COUNT for this build
+    server.motor_control.motor_count.set(server, &(MOTOR_COUNT as u8)).ok();
+    println!("[BLE] motor_count characteristic set to {}", MOTOR_COUNT);
 
     // Run the BLE runner and the advertising/connection loop concurrently
     let _ = join(ble_runner(runner), async {

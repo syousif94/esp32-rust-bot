@@ -45,7 +45,9 @@ pub enum WifiStatus {
 pub struct DisplayState {
     pub motor_a: i8,
     pub motor_b: i8,
+    #[cfg(feature = "four_motor")]
     pub motor_c: i8,
+    #[cfg(feature = "four_motor")]
     pub motor_d: i8,
     pub ip: [u8; 4],
     pub status: WifiStatus,
@@ -109,6 +111,7 @@ pub fn update_motor_b(sender: &DisplaySender, power: i8) {
 }
 
 /// Update motor C power in display state
+#[cfg(feature = "four_motor")]
 pub fn update_motor_c(sender: &DisplaySender, power: i8) {
     sender.send_modify(|state| {
         if let Some(s) = state {
@@ -118,6 +121,7 @@ pub fn update_motor_c(sender: &DisplaySender, power: i8) {
 }
 
 /// Update motor D power in display state
+#[cfg(feature = "four_motor")]
 pub fn update_motor_d(sender: &DisplaySender, power: i8) {
     sender.send_modify(|state| {
         if let Some(s) = state {
@@ -133,7 +137,9 @@ pub fn update_motor(sender: &DisplaySender, index: usize, power: i8) {
             match index {
                 0 => s.motor_a = power,
                 1 => s.motor_b = power,
+                #[cfg(feature = "four_motor")]
                 2 => s.motor_c = power,
+                #[cfg(feature = "four_motor")]
                 3 => s.motor_d = power,
                 _ => {}
             }
@@ -295,10 +301,13 @@ pub async fn display_task(i2c: I2c<'static, Blocking>) {
         let _ = write!(line_buf, "A:{:+4}% B:{:+4}%", state.motor_a, state.motor_b);
         let _ = Text::new(&line_buf, Point::new(0, 42), text_style).draw(&mut display);
         
-        // Line 4: Motors C & D
-        line_buf.clear();
-        let _ = write!(line_buf, "C:{:+4}% D:{:+4}%", state.motor_c, state.motor_d);
-        let _ = Text::new(&line_buf, Point::new(0, 56), text_style).draw(&mut display);
+        // Line 4: Motors C & D (four_motor only)
+        #[cfg(feature = "four_motor")]
+        {
+            line_buf.clear();
+            let _ = write!(line_buf, "C:{:+4}% D:{:+4}%", state.motor_c, state.motor_d);
+            let _ = Text::new(&line_buf, Point::new(0, 56), text_style).draw(&mut display);
+        }
         
         // Flash message overlay (centered banner)
         if state.flash_ticks > 0 {
