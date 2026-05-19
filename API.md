@@ -77,6 +77,24 @@ Returns the motor configuration for this firmware build.
 
 Use this endpoint on connect to discover how many motors are available and adapt your UI accordingly.
 
+#### `GET /battery`
+
+Returns the current battery voltage and estimated percentage (3S LiPo). Available only in `two_motor` builds with an INA219 sensor connected via I2C (SDA=GPIO32, SCL=GPIO33). In `four_motor` builds this endpoint returns zeroes.
+
+**Response** `200 OK`
+
+```json
+{ "voltage": "11.72", "voltage_mv": 11720, "percentage": 57 }
+```
+
+| Field        | Type   | Description                                   |
+| ------------ | ------ | --------------------------------------------- |
+| `voltage`    | string | Bus voltage formatted as `"X.XX"` (volts)     |
+| `voltage_mv` | u16    | Bus voltage in millivolts                     |
+| `percentage` | u8     | Estimated battery percentage (0–100, 3S LiPo) |
+
+The controller HTML page polls this endpoint every 5 seconds to display battery status.
+
 ---
 
 ### Servo
@@ -256,6 +274,7 @@ CoreBluetooth and Android can discover the device by scanning for the service UU
 | Motors      | `E3910003-4567-4321-ABCD-ABCDEF012345` | `[i8; 4]` | 4 bytes | R/W/N  | -100–100 each                | `[0, 0, 0, 0]` | Motor powers (see Motor Count for active count) |
 | WiFi Config | `E3910004-4567-4321-ABCD-ABCDEF012345` | bytes     | 1-97    | W      | `SSID\0PASSWORD` (see below) | —              | Set WiFi credentials, stored in flash           |
 | Motor Count | `E3910005-4567-4321-ABCD-ABCDEF012345` | u8        | 1 byte  | R      | 2 or 4                       | (build-time)   | Number of active motors in this firmware build  |
+| Battery     | `E3910006-4567-4321-ABCD-ABCDEF012345` | `[u8; 3]` | 3 bytes | R/N    | see below                    | `[0, 0, 0]`    | Battery percentage + voltage (two_motor only)   |
 
 #### Motor Count
 
@@ -309,6 +328,19 @@ Credentials are stored in flash and persist across reboots. After writing new cr
 - **Servo Angle**: unsigned byte (`0x00`–`0xB4`). Values above 180 are rejected.
 - **Motors**: 4 signed bytes `[A, B, C, D]`. Each byte is an i8 in the range -100 to +100. Negative values = reverse. In two_motor mode only the first 2 bytes are used; writes with fewer than 2 bytes are rejected. In four_motor mode all 4 bytes are used; writes with fewer than 4 bytes are rejected.
 - **Motor Count**: unsigned byte, read-only. Returns `2` or `4` depending on the firmware build.
+- **Battery**: 3 bytes, read-only with notify. Updated every 2 seconds from the INA219 sensor. See Battery Byte Layout below.
+
+#### Battery Byte Layout
+
+| Byte | Field          | Type | Range | Notes                        |
+| ---- | -------------- | ---- | ----- | ---------------------------- |
+| 0    | Percentage     | u8   | 0–100 | Estimated 3S LiPo percentage |
+| 1    | Voltage (high) | u8   | —     | `voltage_mv >> 8`            |
+| 2    | Voltage (low)  | u8   | —     | `voltage_mv & 0xFF`          |
+
+To reconstruct the voltage in millivolts: `voltage_mv = (byte[1] << 8) | byte[2]`.
+
+The percentage is a piecewise-linear approximation of a 3S LiPo discharge curve (9.0V = 0%, 12.6V = 100%). In `four_motor` builds the battery characteristic always reads `[0, 0, 0]`.
 
 ### Write Behavior
 
@@ -333,6 +365,7 @@ let servoAngleUUID = CBUUID(string: "E3910002-4567-4321-ABCD-ABCDEF012345")
 let motorsUUID     = CBUUID(string: "E3910003-4567-4321-ABCD-ABCDEF012345")
 let wifiConfigUUID = CBUUID(string: "E3910004-4567-4321-ABCD-ABCDEF012345")
 let motorCountUUID = CBUUID(string: "E3910005-4567-4321-ABCD-ABCDEF012345")
+let batteryUUID    = CBUUID(string: "E3910006-4567-4321-ABCD-ABCDEF012345")
 
 class MotorController: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var centralManager: CBCentralManager!
@@ -341,6 +374,7 @@ class MotorController: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate 
     var motorsChar: CBCharacteristic?
     var wifiConfigChar: CBCharacteristic?
     var motorCountChar: CBCharacteristic?
+    var batteryChar: CBCharacteristic?
     var motorCount: Int = 4  // default, updated on connect
 
     override init() {
@@ -394,6 +428,8 @@ class MotorController: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate 
                 motorCountChar = char
                 // Read motor count on discovery
                 peripheral.readValue(for: char)
+            case batteryUUID:
+                batteryChar = char
             default: break
             }
             // Enable notifications
@@ -456,6 +492,12 @@ class MotorController: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate 
                 motorCount = Int(byte)
                 print("Motor count: \(motorCount)")
             }
+        case batteryUUID:
+            if data.count >= 3 {
+                let pct = data[0]
+                let mv = (UInt16(data[1]) << 8) | UInt16(data[2])
+                print("Battery: \(pct)% \(Double(mv) / 1000.0)V")
+            }
         default: break
         }
     }
@@ -475,6 +517,7 @@ val SERVO_ANGLE_UUID = UUID.fromString("E3910002-4567-4321-ABCD-ABCDEF012345")
 val MOTORS_UUID      = UUID.fromString("E3910003-4567-4321-ABCD-ABCDEF012345")
 val WIFI_CONFIG_UUID = UUID.fromString("E3910004-4567-4321-ABCD-ABCDEF012345")
 val MOTOR_COUNT_UUID = UUID.fromString("E3910005-4567-4321-ABCD-ABCDEF012345")
+val BATTERY_UUID     = UUID.fromString("E3910006-4567-4321-ABCD-ABCDEF012345")
 
 // Scan for the ESP32
 val scanner = bluetoothAdapter.bluetoothLeScanner
@@ -536,9 +579,11 @@ val gattCallback = object : BluetoothGattCallback() {
 
 ## Value Ranges Summary
 
-| Control     | Type | Min  | Max | Unit    | Notes              |
-| ----------- | ---- | ---- | --- | ------- | ------------------ |
-| Servo Angle | u8   | 0    | 180 | degrees | Unsigned byte      |
-| Motor Power | i8   | -100 | 100 | percent | Negative = reverse |
+| Control         | Type | Min  | Max | Unit    | Notes              |
+| --------------- | ---- | ---- | --- | ------- | ------------------ |
+| Servo Angle     | u8   | 0    | 180 | degrees | Unsigned byte      |
+| Motor Power     | i8   | -100 | 100 | percent | Negative = reverse |
+| Battery Pct     | u8   | 0    | 100 | percent | 3S LiPo estimate   |
+| Battery Voltage | u16  | 0    | —   | mV      | Big-endian in BLE  |
 
 Both interfaces enforce the same validation. Out-of-range values return a `400` error over HTTP and are rejected (with a serial log message) over BLE.

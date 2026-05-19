@@ -13,7 +13,7 @@ use esp_radio::ble::controller::BleConnector;
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
 use crate::wifi_config::{MAX_SSID_LEN, MAX_PASSWORD_LEN};
-use crate::commands::{Command, send_command, MOTOR_COUNT};
+use crate::commands::{Command, send_command, MOTOR_COUNT, BATTERY_MV, BATTERY_PCT};
 
 /// Max number of BLE connections (1 is typical for a peripheral)
 const CONNECTIONS_MAX: usize = 1;
@@ -63,6 +63,10 @@ struct MotorControlService {
     /// Motor count (read-only): returns the number of motors in this firmware build (2 or 4)
     #[characteristic(uuid = "e3910005-4567-4321-abcd-abcdef012345", read, value = 0)]
     motor_count: u8,
+
+    /// Battery level: 3 bytes [percentage, voltage_mv_hi, voltage_mv_lo], read + notify
+    #[characteristic(uuid = "e3910006-4567-4321-abcd-abcdef012345", read, notify, value = [0, 0, 0])]
+    battery: [u8; 3],
 }
 
 /// Run the BLE host stack background task
@@ -151,8 +155,12 @@ async fn gatt_events_task<P: PacketPool>(
                             println!("[BLE] Unknown handle {:?}, data={:?}", handle, data);
                         }
                     }
-                    GattEvent::Read(_) => {
-                        // Reads are handled automatically by the GATT server
+                    GattEvent::Read(read_event) => {
+                        // Update battery characteristic on every read so clients get fresh data
+                        let mv = BATTERY_MV.load(core::sync::atomic::Ordering::Relaxed);
+                        let pct = BATTERY_PCT.load(core::sync::atomic::Ordering::Relaxed);
+                        let _ = server.motor_control.battery.set(server, &[pct, (mv >> 8) as u8, mv as u8]);
+                        let _ = read_event;
                     }
                     other => {
                         println!("[BLE] Other GATT event: {:?}", core::any::type_name_of_val(other));
@@ -261,6 +269,9 @@ pub async fn ble_task(connector: BleConnector<'static>) {
     // Set motor_count characteristic to the actual MOTOR_COUNT for this build
     server.motor_control.motor_count.set(server, &(MOTOR_COUNT as u8)).ok();
     println!("[BLE] motor_count characteristic set to {}", MOTOR_COUNT);
+
+    // Update battery characteristic periodically in the background
+    // (We'll do it in the advertising loop below since we have access to server)
 
     // Run the BLE runner and the advertising/connection loop concurrently
     let _ = join(ble_runner(runner), async {

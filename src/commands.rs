@@ -5,6 +5,12 @@
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use core::sync::atomic::{AtomicU8, AtomicU16};
+
+/// Battery voltage in millivolts (set by INA219 task, read by HTTP/BLE)
+pub static BATTERY_MV: AtomicU16 = AtomicU16::new(0);
+/// Battery percentage 0-100 (set by INA219 task, read by HTTP/BLE)
+pub static BATTERY_PCT: AtomicU8 = AtomicU8::new(0);
 
 /// Number of motors in this build configuration
 #[cfg(feature = "four_motor")]

@@ -42,6 +42,25 @@
         color: #f44;
       }
 
+      .battery {
+        position: absolute;
+        top: 40px;
+        font-size: 14px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        color: #555;
+        transition: color 0.3s;
+      }
+      .battery.high {
+        color: #0f0;
+      }
+      .battery.mid {
+        color: #fa0;
+      }
+      .battery.low {
+        color: #f44;
+      }
+
       .joystick-area {
         position: relative;
         width: 280px;
@@ -147,6 +166,7 @@
   </head>
   <body>
     <div class="status" id="status">Connected</div>
+    <div class="battery" id="battery">--% &middot; --.--V</div>
 
     <div class="joystick-area" id="joystick">
       <div class="ring">
@@ -402,6 +422,28 @@
 
         updateDisplay(currentLeft, currentRight);
       }
+      // -- Battery polling ----------------------------------------------
+      const batteryEl = document.getElementById('battery');
+
+      async function pollBattery() {
+        try {
+          const c = new AbortController();
+          const t = setTimeout(() => c.abort(), 2000);
+          const res = await fetch(`${baseUrl}/battery`, { signal: c.signal });
+          clearTimeout(t);
+          const data = await res.json();
+          const pct = data.percentage;
+          const v = data.voltage;
+          batteryEl.textContent = `${pct}% \u00B7 ${v}V`;
+          batteryEl.className =
+            'battery ' + (pct > 50 ? 'high' : pct > 20 ? 'mid' : 'low');
+        } catch (e) {
+          // silent — battery display just stays stale
+        }
+      }
+
+      pollBattery();
+      setInterval(pollBattery, 5000);
     </script>
   </body>
 </html>

@@ -12,12 +12,14 @@ use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
     gpio::{Level, Output, OutputConfig},
-    i2c::master::{Config as I2cConfig, I2c},
     ledc::Ledc,
     rng::Rng,
-    time::Rate,
     timer::timg::TimerGroup,
     uart::{Config as UartConfig, Uart},
+};
+use esp_hal::{
+    i2c::master::{Config as I2cConfig, I2c},
+    time::Rate,
 };
 use esp_println::println;
 use esp_radio::ble::controller::BleConnector;
@@ -30,7 +32,9 @@ use esp32_http_servo::brushless::BrushlessMotor;
 #[cfg(feature = "two_motor")]
 use esp32_http_servo::brushless::TB6612Motor;
 use esp32_http_servo::commands::{Command, COMMANDS, MOTOR_COUNT};
-use esp32_http_servo::display::{display_task, init_display_state, update_motor, DisplaySender};
+#[cfg(feature = "four_motor")]
+use esp32_http_servo::display::display_task;
+use esp32_http_servo::display::{init_display_state, update_motor, DisplaySender};
 use esp32_http_servo::servo::{init_servo_timer, ServoController};
 
 use esp32_http_servo::ble::ble_task;
@@ -148,22 +152,27 @@ async fn main(spawner: Spawner) -> ! {
         bus
     };
 
+    // -- INA219 voltage monitor (two_motor only) -----------------------
     #[cfg(feature = "two_motor")]
-    let i2c = {
-        let bus = I2c::new(
+    {
+        let ina_i2c = I2c::new(
             peripherals.I2C0,
             I2cConfig::default().with_frequency(Rate::from_khz(100)),
         )
         .unwrap()
         .with_sda(peripherals.GPIO32)
         .with_scl(peripherals.GPIO33);
-        println!("I2C initialized on GPIO32 (SDA) / GPIO33 (SCL) at 100kHz");
-        bus
-    };
+        println!("INA219 I2C initialized on GPIO32 (SDA) / GPIO33 (SCL)");
+        spawner.spawn(ina219_task(ina_i2c)).ok();
+    }
 
     let display_sender = init_display_state(default_ssid());
-    spawner.spawn(display_task(i2c)).ok();
-    println!("OLED display task spawned");
+
+    #[cfg(feature = "four_motor")]
+    {
+        spawner.spawn(display_task(i2c)).ok();
+        println!("OLED display task spawned");
+    }
 
     // -- Radio (WiFi + BLE) ---------------------------------------------
     let esp_radio_controller =
@@ -215,6 +224,91 @@ async fn main(spawner: Spawner) -> ! {
     #[cfg(feature = "two_motor")]
     {
         command_loop(&mut servo, &mut motors, &display_sender).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// INA219 voltage monitor (two_motor only)
+// ---------------------------------------------------------------------------
+
+/// INA219 default I2C address
+const INA219_ADDR: u8 = 0x42;
+/// Bus Voltage register
+const INA219_REG_BUS_VOLTAGE: u8 = 0x02;
+
+/// Estimate 3S LiPo battery percentage from voltage (in mV).
+///
+/// Piecewise-linear approximation of the discharge curve:
+///   12600 mV = 100%,  12000 mV = 80%,  11400 mV = 50%,
+///   10800 mV = 20%,   10200 mV = 5%,    9000 mV = 0%
+fn battery_percentage_3s(mv: u16) -> u8 {
+    // Table of (millivolts, percentage) breakpoints, descending
+    const TABLE: [(u16, u16); 6] = [
+        (12600, 100),
+        (12000, 80),
+        (11400, 50),
+        (10800, 20),
+        (10200, 5),
+        (9000, 0),
+    ];
+    if mv >= TABLE[0].0 {
+        return 100;
+    }
+    if mv <= TABLE[TABLE.len() - 1].0 {
+        return 0;
+    }
+    // Find the segment and linearly interpolate
+    let mut i = 0;
+    while i < TABLE.len() - 1 {
+        let (v_hi, p_hi) = TABLE[i];
+        let (v_lo, p_lo) = TABLE[i + 1];
+        if mv >= v_lo {
+            // Linear interpolation between the two breakpoints
+            let pct = p_lo + ((mv - v_lo) as u32 * (p_hi - p_lo) as u32
+                / (v_hi - v_lo) as u32) as u16;
+            return pct as u8;
+        }
+        i += 1;
+    }
+    0
+}
+
+/// Periodically reads the INA219 bus voltage and logs it with battery %.
+#[embassy_executor::task]
+async fn ina219_task(mut i2c: I2c<'static, esp_hal::Blocking>) {
+    // Wait a moment for the INA219 to power up
+    embassy_time::Timer::after(Duration::from_millis(200)).await;
+
+    println!("INA219 task started (addr=0x{:02X})", INA219_ADDR);
+
+    // Verify the device is present with a simple read
+    let mut check = [0u8; 2];
+    match i2c.write_read(INA219_ADDR, &[0x00], &mut check) {
+        Ok(()) => println!("INA219 config register: 0x{:04X}", u16::from_be_bytes(check)),
+        Err(e) => println!("INA219 not responding: {:?}", e),
+    }
+
+    let mut buf = [0u8; 2];
+    loop {
+        // Read bus voltage register: write register address, then read 2 bytes
+        match i2c.write_read(INA219_ADDR, &[INA219_REG_BUS_VOLTAGE], &mut buf) {
+            Ok(()) => {
+                let raw = u16::from_be_bytes(buf);
+                // Bits [15:3] contain the voltage value, LSB = 4mV
+                let voltage_mv = (raw >> 3) * 4;
+                let pct = battery_percentage_3s(voltage_mv);
+                // Publish to global state for HTTP/BLE access
+                esp32_http_servo::commands::BATTERY_MV.store(voltage_mv, core::sync::atomic::Ordering::Relaxed);
+                esp32_http_servo::commands::BATTERY_PCT.store(pct, core::sync::atomic::Ordering::Relaxed);
+                let volts = voltage_mv / 1000;
+                let frac = (voltage_mv % 1000) / 10; // two decimal places
+                println!("Battery: {}.{:02}V  {}%", volts, frac, pct);
+            }
+            Err(e) => {
+                println!("INA219 read error: {:?}", e);
+            }
+        }
+        embassy_time::Timer::after(Duration::from_secs(2)).await;
     }
 }
 

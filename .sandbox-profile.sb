@@ -1,0 +1,57 @@
+(version 1)
+
+(deny default)
+
+; Process
+(allow process-fork)
+(allow process-exec)
+(allow signal (target self))
+(allow signal (target children))
+
+; System / IPC
+(allow sysctl-read)
+(allow mach-lookup)
+(allow mach-register)
+(allow ipc-posix-shm-read-data)
+(allow ipc-posix-shm-write-data)
+(allow ipc-posix-shm-write-create)
+
+; File reads (everywhere)
+(allow file-read*)
+(allow file-read-metadata)
+
+; File writes (user-specified directories)
+(allow file-write* (subpath "/Users/syousif/Developer/esp32-http-servo"))
+
+; Temp directories
+(allow file-write* (subpath "/private/var/folders/t_/0_qvx_kn141_w7lhplgh78bm0000gn/T"))
+(allow file-write* (subpath "/private/var/folders/t_/0_qvx_kn141_w7lhplgh78bm0000gn"))
+(allow file-write* (subpath "/private/tmp"))
+(allow file-write* (subpath "/private/var/tmp"))
+(allow file-write* (subpath "/tmp"))
+(allow file-write* (subpath "/var/tmp"))
+
+; Devices
+(allow file-write* (subpath "/dev"))
+
+; Tool caches
+(allow file-write* (subpath "/Users/syousif/Library/Caches"))
+(allow file-write* (subpath "/Users/syousif/Library/Logs"))
+(allow file-write* (subpath "/Users/syousif/.cache"))
+
+; Network
+(allow network* (local ip "localhost:*"))
+(allow network* (remote ip "localhost:*"))
+(allow network* (remote unix-socket))
+
+; Hard denies
+(deny file-write* (subpath "/System"))
+(deny file-write* (subpath "/usr") (with no-report))
+(deny file-write* (subpath "/Library") (with no-report))
+(deny file-write* (subpath "/bin") (with no-report))
+(deny file-write* (subpath "/sbin") (with no-report))
+
+; Sensitive directories
+(deny file-write* (subpath "/Users/syousif/.ssh"))
+(deny file-write* (subpath "/Users/syousif/.gnupg"))
+(deny file-write* (subpath "/Users/syousif/Library/Keychains"))

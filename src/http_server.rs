@@ -2,7 +2,7 @@ use embassy_net::tcp::TcpSocket;
 use embassy_net::Stack;
 use embassy_time::Duration;
 use esp_println::println;
-use crate::commands::{Command, MotorId, send_command, MOTOR_COUNT};
+use crate::commands::{Command, MotorId, send_command, MOTOR_COUNT, BATTERY_MV, BATTERY_PCT};
 
 /// Buffer sizes for HTTP server
 const RX_BUFFER_SIZE: usize = 1024;
@@ -161,6 +161,16 @@ fn handle_request(request: &str) -> HttpResponse {
             } else if path == "/health" {
                 let body = r#"{"healthy": true}"#;
                 HttpResponse::Small(build_response("200 OK", "application/json", body))
+            } else if path == "/battery" {
+                let mv = BATTERY_MV.load(core::sync::atomic::Ordering::Relaxed);
+                let pct = BATTERY_PCT.load(core::sync::atomic::Ordering::Relaxed);
+                let volts = mv / 1000;
+                let frac = (mv % 1000) / 10;
+                let body = alloc::format!(
+                    r#"{{"voltage":"{}.{:02}","voltage_mv":{},"percentage":{}}}"#,
+                    volts, frac, mv, pct
+                );
+                HttpResponse::Small(build_response("200 OK", "application/json", &body))
             } else if path == "/config" {
                 #[cfg(feature = "four_motor")]
                 let body = r#"{"motor_mode":"four_motor","motor_count":4,"motors":["a","b","c","d"]}"#;
