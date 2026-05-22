@@ -4,9 +4,10 @@
 extern crate alloc;
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_net::StackResources;
-use embassy_time::{Duration, Instant};
+use embassy_sync::mutex::Mutex;
+use embassy_time::{Duration, Instant, Timer};
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::{
@@ -24,18 +25,21 @@ use esp_hal::{
 use esp_println::println;
 use esp_radio::ble::controller::BleConnector;
 use esp_storage::FlashStorage;
+use heapless::Vec as HVec;
 use static_cell::StaticCell;
 
-use esp32_http_servo::brushless::{init_motor_timer, MotorControl};
 #[cfg(feature = "four_motor")]
 use esp32_http_servo::brushless::BrushlessMotor;
 #[cfg(feature = "two_motor")]
 use esp32_http_servo::brushless::TB6612Motor;
-use esp32_http_servo::commands::{Command, COMMANDS, MOTOR_COUNT};
+use esp32_http_servo::brushless::{MotorControl, init_motor_timer};
+use esp32_http_servo::commands::{COMMANDS, Command, MOTOR_COUNT};
 #[cfg(feature = "four_motor")]
 use esp32_http_servo::display::display_task;
-use esp32_http_servo::display::{init_display_state, update_motor, DisplaySender};
-use esp32_http_servo::servo::{init_servo_timer, ServoController};
+use esp32_http_servo::display::{DisplaySender, init_display_state, update_motor};
+use esp32_http_servo::st3215::{
+    MAX_SERVOS, SHARED_BUS, SHARED_LIST, ServoList, SharedBus, SharedList, St3215Bus,
+};
 
 use esp32_http_servo::ble::ble_task;
 use esp32_http_servo::serial_cmd::serial_input_task;
@@ -63,34 +67,50 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // Heap + RTOS timer
-    esp_alloc::heap_allocator!(size: 64 * 1024);
+    // Heap + RTOS timer.
+    //
+    // Keep some stack headroom below the stack-breaking 64K setting, but give
+    // WiFi enough normal heap that ARP/TCP stay responsive after DHCP.
+    esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: 60 * 1024);
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
 
-    // -- UART (serial commands) ----------------------------------------
+    // -- UART0 (serial commands console) --------------------------------
     let uart0 = Uart::new(peripherals.UART0, UartConfig::default()).unwrap();
     spawner.spawn(serial_input_task(uart0)).ok();
 
-    // -- LEDC / servo / motors ------------------------------------------
-    let ledc = mk_static!(Ledc<'static>, Ledc::new(peripherals.LEDC));
+    // -- UART1 (ST3215 bus servo @ 1 Mbps) -----------------------------
+    // Waveshare General Driver for Robots: RX=GPIO18, TX=GPIO19.
+    let bus_uart = Uart::new(
+        peripherals.UART1,
+        UartConfig::default().with_baudrate(1_000_000),
+    )
+    .unwrap()
+    .with_rx(peripherals.GPIO18)
+    .with_tx(peripherals.GPIO19);
 
-    let servo_timer = mk_static!(
-        esp_hal::ledc::timer::Timer<'static, esp_hal::ledc::HighSpeed>,
-        init_servo_timer(ledc)
-    );
-    let mut servo = ServoController::new(servo_timer, peripherals.GPIO18);
-    servo.set_angle(90);
-    println!("Servo initialized on GPIO18 at 90 degrees");
+    let shared_bus: &'static SharedBus =
+        mk_static!(SharedBus, Mutex::new(St3215Bus::new(bus_uart)));
+    SHARED_BUS.init(shared_bus).ok();
+
+    let shared_list: &'static SharedList = mk_static!(SharedList, Mutex::new(HVec::new()));
+    SHARED_LIST.init(shared_list).ok();
+
+    println!("ST3215 bus initialized on UART1 (RX=GPIO18, TX=GPIO19 @ 1Mbps)");
+
+    // -- LEDC / motors --------------------------------------------------
+    let ledc = mk_static!(Ledc<'static>, Ledc::new(peripherals.LEDC));
 
     let motor_timer = mk_static!(
         esp_hal::ledc::timer::Timer<'static, esp_hal::ledc::HighSpeed>,
         init_motor_timer(ledc)
     );
+
     // -- Motor pin setup (conditional on feature) ----------------------
     #[cfg(feature = "four_motor")]
     let mut motors = {
-        // Pre-configure all motor pins as output low to prevent them being high on startup
+        // NOTE: this branch is gated by a compile_error! in lib.rs because
+        // GPIO19 conflicts with the ST3215 TX line. Kept here for symmetry.
         let gpio32 = Output::new(peripherals.GPIO32, Level::Low, OutputConfig::default());
         let gpio33 = Output::new(peripherals.GPIO33, Level::Low, OutputConfig::default());
         let gpio25 = Output::new(peripherals.GPIO25, Level::Low, OutputConfig::default());
@@ -101,39 +121,74 @@ async fn main(spawner: Spawner) -> ! {
         let gpio23 = Output::new(peripherals.GPIO23, Level::Low, OutputConfig::default());
 
         let mut m: [BrushlessMotor; 4] = [
-            BrushlessMotor::new(motor_timer, gpio32, gpio33,
-                esp_hal::ledc::channel::Number::Channel1, esp_hal::ledc::channel::Number::Channel2, "Motor A"),
-            BrushlessMotor::new(motor_timer, gpio25, gpio26,
-                esp_hal::ledc::channel::Number::Channel3, esp_hal::ledc::channel::Number::Channel4, "Motor B"),
-            BrushlessMotor::new(motor_timer, gpio19, gpio21,
-                esp_hal::ledc::channel::Number::Channel5, esp_hal::ledc::channel::Number::Channel6, "Motor C"),
-            BrushlessMotor::new(motor_timer, gpio22, gpio23,
-                esp_hal::ledc::channel::Number::Channel7, esp_hal::ledc::channel::Number::Channel0, "Motor D"),
+            BrushlessMotor::new(
+                motor_timer,
+                gpio32,
+                gpio33,
+                esp_hal::ledc::channel::Number::Channel1,
+                esp_hal::ledc::channel::Number::Channel2,
+                "Motor A",
+            ),
+            BrushlessMotor::new(
+                motor_timer,
+                gpio25,
+                gpio26,
+                esp_hal::ledc::channel::Number::Channel3,
+                esp_hal::ledc::channel::Number::Channel4,
+                "Motor B",
+            ),
+            BrushlessMotor::new(
+                motor_timer,
+                gpio19,
+                gpio21,
+                esp_hal::ledc::channel::Number::Channel5,
+                esp_hal::ledc::channel::Number::Channel6,
+                "Motor C",
+            ),
+            BrushlessMotor::new(
+                motor_timer,
+                gpio22,
+                gpio23,
+                esp_hal::ledc::channel::Number::Channel7,
+                esp_hal::ledc::channel::Number::Channel0,
+                "Motor D",
+            ),
         ];
-        for motor in m.iter_mut() { motor.set_power(0); }
+        for motor in m.iter_mut() {
+            motor.set_power(0);
+        }
         m
     };
 
     #[cfg(feature = "two_motor")]
     let mut motors = {
-        // TB6612 2-motor configuration (STBY is hardwired to 3.3V)
-        // Pin mapping from schematic: S0=GPIO25(PWMA), S1=GPIO17(AIN2),
-        // S2=GPIO21(AIN1), S3=GPIO22(BIN1), S4=GPIO23(BIN2), S5=GPIO26(PWMB)
-
-        // Motor A: AIN1 = GPIO21, AIN2 = GPIO17, PWMA = GPIO25
+        // TB6612 2-motor configuration (STBY hardwired to 3.3V)
         let ain1 = Output::new(peripherals.GPIO21, Level::Low, OutputConfig::default());
         let ain2 = Output::new(peripherals.GPIO17, Level::Low, OutputConfig::default());
-        // Motor B: BIN1 = GPIO22, BIN2 = GPIO23, PWMB = GPIO26
         let bin1 = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());
         let bin2 = Output::new(peripherals.GPIO23, Level::Low, OutputConfig::default());
 
         let mut m: [TB6612Motor; 2] = [
-            TB6612Motor::new(motor_timer, ain1, ain2, peripherals.GPIO25,
-                esp_hal::ledc::channel::Number::Channel1, "Motor A"),
-            TB6612Motor::new(motor_timer, bin1, bin2, peripherals.GPIO26,
-                esp_hal::ledc::channel::Number::Channel2, "Motor B"),
+            TB6612Motor::new(
+                motor_timer,
+                ain1,
+                ain2,
+                peripherals.GPIO25,
+                esp_hal::ledc::channel::Number::Channel1,
+                "Motor A",
+            ),
+            TB6612Motor::new(
+                motor_timer,
+                bin1,
+                bin2,
+                peripherals.GPIO26,
+                esp_hal::ledc::channel::Number::Channel2,
+                "Motor B",
+            ),
         ];
-        for motor in m.iter_mut() { motor.set_power(0); }
+        for motor in m.iter_mut() {
+            motor.set_power(0);
+        }
         println!("TB6612 2-motor config: STBY=3.3V (always on), PWMA=GPIO25, PWMB=GPIO26");
         m
     };
@@ -167,6 +222,7 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     let display_sender = init_display_state(default_ssid());
+    println!("Boot: display state initialized");
 
     #[cfg(feature = "four_motor")]
     {
@@ -175,23 +231,20 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     // -- Radio (WiFi + BLE) ---------------------------------------------
+    println!("Boot: initializing radio controller");
     let esp_radio_controller =
         mk_static!(esp_radio::Controller<'static>, esp_radio::init().unwrap());
+    println!("Boot: radio controller initialized");
 
-    let connector = BleConnector::new(
-        esp_radio_controller,
-        peripherals.BT,
-        Default::default(),
-    )
-    .unwrap();
+    println!("Boot: initializing BLE connector");
+    let connector =
+        BleConnector::new(esp_radio_controller, peripherals.BT, Default::default()).unwrap();
     println!("BLE connector initialized");
 
-    let (controller, interfaces) = esp_radio::wifi::new(
-        esp_radio_controller,
-        peripherals.WIFI,
-        esp_radio::wifi::Config::default(),
-    )
-    .unwrap();
+    let wifi_cfg = esp_radio::wifi::Config::default();
+    let (controller, interfaces) =
+        esp_radio::wifi::new(esp_radio_controller, peripherals.WIFI, wifi_cfg).unwrap();
+    println!("Boot: WiFi interface initialized");
 
     let net_config = embassy_net::Config::dhcpv4(Default::default());
     let rng = Rng::new();
@@ -203,46 +256,71 @@ async fn main(spawner: Spawner) -> ! {
         mk_static!(StackResources<5>, StackResources::<5>::new()),
         seed,
     );
+    println!("Boot: network stack initialized");
 
-    let flash_storage = mk_static!(
-        FlashStorage<'static>,
-        FlashStorage::new(peripherals.FLASH)
-    );
+    let flash_storage = mk_static!(FlashStorage<'static>, FlashStorage::new(peripherals.FLASH));
 
     // -- Spawn background tasks -----------------------------------------
     spawner.spawn(ble_task(connector)).ok();
-    spawner.spawn(wifi_config_task(flash_storage, display_sender.clone())).ok();
-    spawner.spawn(wifi_connection_task(controller, display_sender.clone())).ok();
+    spawner
+        .spawn(wifi_config_task(flash_storage, display_sender.clone()))
+        .ok();
+    spawner
+        .spawn(wifi_connection_task(controller, display_sender.clone()))
+        .ok();
     spawner.spawn(net_task(runner)).ok();
-    spawner.spawn(wifi_ready_task(spawner, stack, display_sender.clone())).ok();
+    spawner
+        .spawn(wifi_ready_task(spawner, stack, display_sender.clone()))
+        .ok();
+    println!("Boot: WiFi tasks spawned");
+
+    // -- Boot scan for ST3215 servos -----------------------------------
+    // Give peripherals a moment to settle.
+    Timer::after(Duration::from_millis(50)).await;
+    st_rescan(1, 20).await;
 
     // -- Command loop ---------------------------------------------------
-    #[cfg(feature = "four_motor")]
-    {
-        command_loop(&mut servo, &mut motors, &display_sender).await
+    command_loop(&mut motors, &display_sender).await
+}
+
+/// Re-scan the ST3215 bus and update the shared list.
+async fn st_rescan(from: u8, to: u8) {
+    let Some(bus) = SHARED_BUS.try_get() else {
+        return;
+    };
+    let Some(list) = SHARED_LIST.try_get() else {
+        return;
+    };
+    let mut bus_guard = bus.lock().await;
+    let mut list_guard = list.lock().await;
+    bus_guard.scan(from, to, &mut list_guard).await;
+    if list_guard.is_empty() {
+        println!("ST3215 scan ({}..={}): no servos found", from, to);
+    } else {
+        print_servo_list(&list_guard);
     }
-    #[cfg(feature = "two_motor")]
-    {
-        command_loop(&mut servo, &mut motors, &display_sender).await
+}
+
+fn print_servo_list(list: &ServoList) {
+    use core::fmt::Write;
+    let mut s: heapless::String<128> = heapless::String::new();
+    for (i, id) in list.iter().enumerate() {
+        if i > 0 {
+            let _ = s.push_str(", ");
+        }
+        let _ = write!(s, "{}", id);
     }
+    println!("ST3215 servos found ({}): [{}]", list.len(), s);
 }
 
 // ---------------------------------------------------------------------------
 // INA219 voltage monitor (two_motor only)
 // ---------------------------------------------------------------------------
 
-/// INA219 default I2C address
 const INA219_ADDR: u8 = 0x42;
-/// Bus Voltage register
 const INA219_REG_BUS_VOLTAGE: u8 = 0x02;
 
-/// Estimate 3S LiPo battery percentage from voltage (in mV).
-///
-/// Piecewise-linear approximation of the discharge curve:
-///   12600 mV = 100%,  12000 mV = 80%,  11400 mV = 50%,
-///   10800 mV = 20%,   10200 mV = 5%,    9000 mV = 0%
 fn battery_percentage_3s(mv: u16) -> u8 {
-    // Table of (millivolts, percentage) breakpoints, descending
     const TABLE: [(u16, u16); 6] = [
         (12600, 100),
         (12000, 80),
@@ -257,15 +335,13 @@ fn battery_percentage_3s(mv: u16) -> u8 {
     if mv <= TABLE[TABLE.len() - 1].0 {
         return 0;
     }
-    // Find the segment and linearly interpolate
     let mut i = 0;
     while i < TABLE.len() - 1 {
         let (v_hi, p_hi) = TABLE[i];
         let (v_lo, p_lo) = TABLE[i + 1];
         if mv >= v_lo {
-            // Linear interpolation between the two breakpoints
-            let pct = p_lo + ((mv - v_lo) as u32 * (p_hi - p_lo) as u32
-                / (v_hi - v_lo) as u32) as u16;
+            let pct =
+                p_lo + ((mv - v_lo) as u32 * (p_hi - p_lo) as u32 / (v_hi - v_lo) as u32) as u16;
             return pct as u8;
         }
         i += 1;
@@ -273,94 +349,160 @@ fn battery_percentage_3s(mv: u16) -> u8 {
     0
 }
 
-/// Periodically reads the INA219 bus voltage and logs it with battery %.
 #[embassy_executor::task]
 async fn ina219_task(mut i2c: I2c<'static, esp_hal::Blocking>) {
-    // Wait a moment for the INA219 to power up
-    embassy_time::Timer::after(Duration::from_millis(200)).await;
-
+    Timer::after(Duration::from_millis(200)).await;
     println!("INA219 task started (addr=0x{:02X})", INA219_ADDR);
 
-    // Verify the device is present with a simple read
     let mut check = [0u8; 2];
     match i2c.write_read(INA219_ADDR, &[0x00], &mut check) {
-        Ok(()) => println!("INA219 config register: 0x{:04X}", u16::from_be_bytes(check)),
+        Ok(()) => println!(
+            "INA219 config register: 0x{:04X}",
+            u16::from_be_bytes(check)
+        ),
         Err(e) => println!("INA219 not responding: {:?}", e),
     }
 
     let mut buf = [0u8; 2];
     loop {
-        // Read bus voltage register: write register address, then read 2 bytes
         match i2c.write_read(INA219_ADDR, &[INA219_REG_BUS_VOLTAGE], &mut buf) {
             Ok(()) => {
                 let raw = u16::from_be_bytes(buf);
-                // Bits [15:3] contain the voltage value, LSB = 4mV
                 let voltage_mv = (raw >> 3) * 4;
                 let pct = battery_percentage_3s(voltage_mv);
-                // Publish to global state for HTTP/BLE access
-                esp32_http_servo::commands::BATTERY_MV.store(voltage_mv, core::sync::atomic::Ordering::Relaxed);
-                esp32_http_servo::commands::BATTERY_PCT.store(pct, core::sync::atomic::Ordering::Relaxed);
+                esp32_http_servo::commands::BATTERY_MV
+                    .store(voltage_mv, core::sync::atomic::Ordering::Relaxed);
+                esp32_http_servo::commands::BATTERY_PCT
+                    .store(pct, core::sync::atomic::Ordering::Relaxed);
                 let volts = voltage_mv / 1000;
-                let frac = (voltage_mv % 1000) / 10; // two decimal places
+                let frac = (voltage_mv % 1000) / 10;
                 println!("Battery: {}.{:02}V  {}%", volts, frac, pct);
             }
             Err(e) => {
                 println!("INA219 read error: {:?}", e);
             }
         }
-        embassy_time::Timer::after(Duration::from_secs(2)).await;
+        Timer::after(Duration::from_secs(2)).await;
     }
 }
 
-/// Receive commands from any source and drive the actuators.
+/// Command loop: receives commands and drives motors + ST3215 bus.
 ///
-/// The `select(receive, yield_now)` pattern keeps the executor cycling so
-/// radio coex events (WiFi / BLE) are serviced promptly.
-///
-/// A 500ms watchdog is implemented via `Instant`: if no command is received
-/// within 500ms, all motors are automatically stopped. This prevents motors
-/// from being stuck at a power level when the controller loses connectivity.
+/// Motors are watchdogged at 500ms (auto-stop if no motor command). ST3215
+/// servos hold position by themselves and are exempt from the watchdog.
 async fn command_loop<M: MotorControl>(
-    servo: &mut ServoController<'_>,
     motors: &mut [M; MOTOR_COUNT],
     display_sender: &DisplaySender,
 ) -> ! {
     let mut last_powers = [0i8; MOTOR_COUNT];
-    let mut last_cmd_time = Instant::now();
+    let mut last_motor_cmd = Instant::now();
 
     loop {
-        match select(COMMANDS.receive(), embassy_futures::yield_now()).await {
-            Either::First(cmd) => {
-                last_cmd_time = Instant::now();
-                match cmd {
-                    Command::Servo(angle) => {
-                        servo.set_angle(angle);
-                        println!("Servo moved to {} degrees", angle);
+        match select(COMMANDS.receive(), Timer::after(Duration::from_millis(50))).await {
+            Either::First(cmd) => match cmd {
+                Command::Motor(id, power) => {
+                    last_motor_cmd = Instant::now();
+                    let idx = id as usize;
+                    motors[idx].set_power(power);
+                    update_motor(display_sender, idx, power);
+                    last_powers[idx] = power;
+                    println!("Motor {:?} set to {}%", id, power);
+                }
+                Command::MotorsAll(powers) => {
+                    last_motor_cmd = Instant::now();
+                    for (i, &p) in powers.iter().enumerate() {
+                        motors[i].set_power(p);
+                        update_motor(display_sender, i, p);
                     }
-                    Command::Motor(id, power) => {
-                        let idx = id as usize;
-                        motors[idx].set_power(power);
-                        update_motor(display_sender, idx, power);
-                        last_powers[idx] = power;
-                        println!("Motor {:?} set to {}%", id, power);
-                    }
-                    Command::MotorsAll(powers) => {
-                        for (i, &p) in powers.iter().enumerate() {
-                            motors[i].set_power(p);
-                            update_motor(display_sender, i, p);
+                    last_powers = powers;
+                    #[cfg(feature = "four_motor")]
+                    println!(
+                        "Motors set to A={}% B={}% C={}% D={}%",
+                        powers[0], powers[1], powers[2], powers[3]
+                    );
+                    #[cfg(feature = "two_motor")]
+                    println!("Motors set to A={}% B={}%", powers[0], powers[1]);
+                }
+                Command::St3215Move {
+                    id,
+                    pos,
+                    speed,
+                    acc,
+                } => {
+                    if let Some(bus) = SHARED_BUS.try_get() {
+                        let mut g = bus.lock().await;
+                        match g.write_pos(id, pos, speed, acc).await {
+                            Ok(()) => println!(
+                                "ST3215[{}] -> pos={} speed={} acc={}",
+                                id, pos, speed, acc
+                            ),
+                            Err(e) => println!("ST3215[{}] move error: {:?}", id, e),
                         }
-                        last_powers = powers;
-                        #[cfg(feature = "four_motor")]
-                        println!("Motors set to A={}% B={}% C={}% D={}%", powers[0], powers[1], powers[2], powers[3]);
-                        #[cfg(feature = "two_motor")]
-                        println!("Motors set to A={}% B={}%", powers[0], powers[1]);
                     }
                 }
-            }
+                Command::St3215MoveAll {
+                    count,
+                    moves,
+                    speed,
+                    acc,
+                } => {
+                    if let Some(bus) = SHARED_BUS.try_get() {
+                        // Build the (id, pos, speed, acc) array for sync_write.
+                        let mut buf: HVec<(u8, u16, u16, u8), MAX_SERVOS> = HVec::new();
+                        for i in 0..count.min(MAX_SERVOS as u8) as usize {
+                            let (id, pos) = moves[i];
+                            let _ = buf.push((id, pos, speed, acc));
+                        }
+                        let mut g = bus.lock().await;
+                        match g.sync_write_pos(&buf).await {
+                            Ok(()) => println!(
+                                "ST3215 sync_write {} servos @ speed={} acc={}",
+                                buf.len(),
+                                speed,
+                                acc
+                            ),
+                            Err(e) => println!("ST3215 sync_write error: {:?}", e),
+                        }
+                    }
+                }
+                Command::St3215Torque { id, enable } => {
+                    if let Some(bus) = SHARED_BUS.try_get() {
+                        let mut g = bus.lock().await;
+                        match g.set_torque(id, enable).await {
+                            Ok(()) => println!("ST3215[{}] torque={}", id, enable),
+                            Err(e) => println!("ST3215[{}] torque error: {:?}", id, e),
+                        }
+                    }
+                }
+                Command::St3215SetId { current, new } => {
+                    if let Some(bus) = SHARED_BUS.try_get() {
+                        let mut g = bus.lock().await;
+                        match g.write_id(current, new).await {
+                            Ok(()) => {
+                                println!("ST3215 id {} -> {}", current, new);
+                                drop(g);
+                                st_rescan(1, 20).await;
+                            }
+                            Err(e) => println!("ST3215 set_id error: {:?}", e),
+                        }
+                    }
+                }
+                Command::St3215Ping { id } => {
+                    if let Some(bus) = SHARED_BUS.try_get() {
+                        let mut g = bus.lock().await;
+                        match g.ping(id).await {
+                            Ok(()) => println!("ST3215[{}] ping OK", id),
+                            Err(e) => println!("ST3215[{}] ping error: {:?}", id, e),
+                        }
+                    }
+                }
+                Command::St3215Rescan { from, to } => {
+                    st_rescan(from, to).await;
+                }
+            },
             Either::Second(_) => {
-                // Watchdog: no command for 500ms — stop motors if any are active
                 if last_powers.iter().any(|&p| p != 0)
-                    && last_cmd_time.elapsed() >= Duration::from_millis(500)
+                    && last_motor_cmd.elapsed() >= Duration::from_millis(500)
                 {
                     println!("Watchdog: stopping all motors (no command for 500ms)");
                     for (i, m) in motors.iter_mut().enumerate() {

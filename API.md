@@ -262,9 +262,9 @@ CoreBluetooth and Android can discover the device by scanning for the service UU
 
 | Field        | Value                                  |
 | ------------ | -------------------------------------- |
-| Service UUID | `E3910010-4567-4321-ABCD-ABCDEF012345` |
+| Service UUID | `E3910030-4567-4321-ABCD-ABCDEF012345` |
 
-> **Note:** Service UUID changed from `E3910001-...` to `E3910010-...` to force GATT cache refresh on clients after adding WiFi config characteristic.
+> **Note:** Service UUID changed from `E3910001-...` to `E3910030-...` to force GATT cache refresh on clients after GATT layout changes.
 
 ### Characteristics
 
@@ -359,8 +359,8 @@ Reading a characteristic returns the last value set by any interface (BLE, HTTP,
 ```swift
 import CoreBluetooth
 
-// UUIDs (Service UUID updated to E3910010 for GATT cache refresh)
-let serviceUUID    = CBUUID(string: "E3910010-4567-4321-ABCD-ABCDEF012345")
+// UUIDs (Service UUID updated to E3910030 for GATT cache refresh)
+let serviceUUID    = CBUUID(string: "E3910030-4567-4321-ABCD-ABCDEF012345")
 let servoAngleUUID = CBUUID(string: "E3910002-4567-4321-ABCD-ABCDEF012345")
 let motorsUUID     = CBUUID(string: "E3910003-4567-4321-ABCD-ABCDEF012345")
 let wifiConfigUUID = CBUUID(string: "E3910004-4567-4321-ABCD-ABCDEF012345")
@@ -511,8 +511,8 @@ import android.bluetooth.*
 import android.bluetooth.le.*
 import java.util.UUID
 
-// UUIDs (Service UUID updated to E3910010 for GATT cache refresh)
-val SERVICE_UUID     = UUID.fromString("E3910010-4567-4321-ABCD-ABCDEF012345")
+// UUIDs (Service UUID updated to E3910030 for GATT cache refresh)
+val SERVICE_UUID     = UUID.fromString("E3910030-4567-4321-ABCD-ABCDEF012345")
 val SERVO_ANGLE_UUID = UUID.fromString("E3910002-4567-4321-ABCD-ABCDEF012345")
 val MOTORS_UUID      = UUID.fromString("E3910003-4567-4321-ABCD-ABCDEF012345")
 val WIFI_CONFIG_UUID = UUID.fromString("E3910004-4567-4321-ABCD-ABCDEF012345")

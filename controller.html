@@ -6,113 +6,91 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0, user-scalable=no"
     />
-    <title>ESP32 Car Controller</title>
+    <title>ESP32 Robot Controller</title>
     <style>
-      * {
-        margin: 0;
-        padding: 0;
-        box-sizing: border-box;
-      }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
       body {
         background: #000;
         color: #fff;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-        height: 100dvh;
+        min-height: 100dvh;
         display: flex;
         flex-direction: column;
         align-items: center;
-        justify-content: center;
-        overflow: hidden;
-        touch-action: none;
+        padding: 60px 12px 40px;
+        overflow-x: hidden;
+        touch-action: manipulation;
         -webkit-user-select: none;
         user-select: none;
       }
 
       .status {
-        position: absolute;
-        top: 20px;
+        position: fixed;
+        top: 16px; left: 12px;
         font-size: 12px;
         color: #555;
         transition: color 0.3s;
+        z-index: 10;
       }
-      .status.ok {
-        color: #0f0;
-      }
-      .status.err {
-        color: #f44;
-      }
+      .status.ok { color: #0f0; }
+      .status.err { color: #f44; }
 
       .battery {
-        position: absolute;
-        top: 40px;
+        position: fixed;
+        top: 16px; right: 12px;
         font-size: 14px;
         font-weight: 600;
         font-variant-numeric: tabular-nums;
         color: #555;
         transition: color 0.3s;
+        z-index: 10;
       }
-      .battery.high {
-        color: #0f0;
-      }
-      .battery.mid {
-        color: #fa0;
-      }
-      .battery.low {
-        color: #f44;
+      .battery.high { color: #0f0; }
+      .battery.mid  { color: #fa0; }
+      .battery.low  { color: #f44; }
+
+      h2 {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        color: #666;
+        margin-bottom: 12px;
       }
 
+      .panel {
+        background: #0a0a0a;
+        border: 1px solid #1a1a1a;
+        border-radius: 12px;
+        padding: 18px;
+        margin: 12px 0;
+        width: 100%;
+        max-width: 520px;
+      }
+
+      /* -- joystick (touch-area, centered) -- */
       .joystick-area {
         position: relative;
-        width: 280px;
-        height: 280px;
+        width: 260px;
+        height: 260px;
+        margin: 0 auto;
+        touch-action: none;
       }
-
       .ring {
-        position: absolute;
-        inset: 0;
+        position: absolute; inset: 0;
         border: 2px solid #333;
         border-radius: 50%;
       }
-
-      .ring-label {
-        position: absolute;
-        top: -24px;
-        width: 100%;
-        text-align: center;
-        font-size: 11px;
-        color: #444;
-        letter-spacing: 2px;
-        text-transform: uppercase;
-      }
-
-      .crosshair-x,
-      .crosshair-y {
-        position: absolute;
-        background: #1a1a1a;
-      }
-      .crosshair-x {
-        top: 50%;
-        left: 10%;
-        right: 10%;
-        height: 1px;
-      }
-      .crosshair-y {
-        left: 50%;
-        top: 10%;
-        bottom: 10%;
-        width: 1px;
-      }
-
+      .crosshair-x, .crosshair-y { position: absolute; background: #1a1a1a; }
+      .crosshair-x { top: 50%; left: 10%; right: 10%; height: 1px; }
+      .crosshair-y { left: 50%; top: 10%; bottom: 10%; width: 1px; }
       .dot {
         position: absolute;
-        width: 56px;
-        height: 56px;
+        width: 56px; height: 56px;
         border-radius: 50%;
         background: radial-gradient(circle at 40% 38%, #2af, #07f);
         box-shadow: 0 0 20px rgba(0, 170, 255, 0.4);
         transform: translate(-50%, -50%);
-        top: 50%;
-        left: 50%;
+        top: 50%; left: 50%;
         cursor: grab;
         z-index: 5;
         transition: box-shadow 0.2s;
@@ -121,90 +99,187 @@
         box-shadow: 0 0 32px rgba(0, 170, 255, 0.7);
         cursor: grabbing;
       }
-
       .telemetry {
-        position: absolute;
-        bottom: 28px;
-        display: flex;
-        gap: 40px;
+        display: flex; gap: 40px; justify-content: center;
+        margin-top: 14px;
         font-size: 13px;
       }
-
-      .motor-info {
-        text-align: center;
-      }
+      .motor-info { text-align: center; }
       .motor-info .label {
-        color: #555;
-        font-size: 11px;
-        text-transform: uppercase;
-        letter-spacing: 1px;
+        color: #555; font-size: 11px;
+        text-transform: uppercase; letter-spacing: 1px;
         margin-bottom: 4px;
       }
       .motor-info .value {
-        font-size: 28px;
-        font-weight: 600;
+        font-size: 28px; font-weight: 600;
         font-variant-numeric: tabular-nums;
-        min-width: 60px;
-        display: inline-block;
+        min-width: 60px; display: inline-block;
       }
-      .motor-info .value.pos {
-        color: #0f0;
+      .motor-info .value.pos  { color: #0f0; }
+      .motor-info .value.neg  { color: #f44; }
+      .motor-info .value.zero { color: #444; }
+
+      /* -- servo panel -- */
+      .panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 14px;
       }
-      .motor-info .value.neg {
-        color: #f44;
+      .btn {
+        background: #1a1a1a;
+        color: #ccc;
+        border: 1px solid #333;
+        border-radius: 6px;
+        padding: 6px 12px;
+        font-size: 12px;
+        cursor: pointer;
+        font-family: inherit;
       }
-      .motor-info .value.zero {
-        color: #444;
+      .btn:hover { background: #222; color: #fff; }
+      .btn.primary { background: #0066cc; color: #fff; border-color: #0077ee; }
+      .btn.primary:hover { background: #0077ee; }
+      .btn.danger { color: #f88; border-color: #663; }
+
+      .all-row {
+        display: flex; align-items: center; gap: 10px;
+        margin-bottom: 14px;
+        padding: 10px 12px;
+        background: #060606;
+        border-radius: 8px;
+      }
+      .all-row label {
+        font-size: 11px; color: #888;
+        text-transform: uppercase; letter-spacing: 1px;
+      }
+      .all-row input[type=range] { flex: 1; }
+
+      .servo-card {
+        background: #060606;
+        border: 1px solid #161616;
+        border-radius: 8px;
+        padding: 12px;
+        margin-top: 10px;
+      }
+      .servo-head {
+        display: flex; align-items: center; justify-content: space-between;
+        margin-bottom: 10px;
+      }
+      .servo-id {
+        font-size: 16px; font-weight: 600; color: #2af;
+      }
+      .servo-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+      .servo-row {
+        display: flex; align-items: center; gap: 10px;
+        margin-top: 8px;
+      }
+      .servo-row input[type=range] { flex: 1; }
+      .servo-pos {
+        font-variant-numeric: tabular-nums;
+        font-size: 13px;
+        color: #ccc;
+        min-width: 56px;
+        text-align: right;
+      }
+      .servo-meta {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 6px;
+        margin-top: 8px;
+        font-size: 11px;
+        color: #777;
+        font-variant-numeric: tabular-nums;
+      }
+      .servo-meta .k { color: #555; margin-right: 4px; }
+      .empty {
+        color: #555;
+        text-align: center;
+        padding: 24px 0;
+        font-size: 13px;
       }
 
-      .motor-detail {
-        font-size: 11px;
-        color: #555;
-        margin-top: 2px;
+      input[type=range] {
+        -webkit-appearance: none;
+        height: 4px;
+        background: #222;
+        border-radius: 2px;
+        outline: none;
+      }
+      input[type=range]::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        width: 22px; height: 22px;
+        border-radius: 50%;
+        background: #2af;
+        cursor: pointer;
+      }
+      input[type=range]::-moz-range-thumb {
+        width: 22px; height: 22px;
+        border-radius: 50%;
+        background: #2af;
+        border: 0;
+        cursor: pointer;
       }
     </style>
   </head>
   <body>
-    <div class="status" id="status">Connected</div>
+    <div class="status" id="status">Connecting…</div>
     <div class="battery" id="battery">--% &middot; --.--V</div>
 
-    <div class="joystick-area" id="joystick">
-      <div class="ring">
-        <span class="ring-label">100%</span>
+    <!-- Joystick panel -->
+    <div class="panel">
+      <h2>Drive</h2>
+      <div class="joystick-area" id="joystick">
+        <div class="ring"></div>
+        <div class="crosshair-x"></div>
+        <div class="crosshair-y"></div>
+        <div class="dot" id="dot"></div>
       </div>
-      <div class="crosshair-x"></div>
-      <div class="crosshair-y"></div>
-      <div class="dot" id="dot"></div>
+      <div class="telemetry">
+        <div class="motor-info">
+          <div class="label">Left</div>
+          <div class="value zero" id="left-val">0</div>
+        </div>
+        <div class="motor-info">
+          <div class="label">Right</div>
+          <div class="value zero" id="right-val">0</div>
+        </div>
+      </div>
     </div>
 
-    <div class="telemetry">
-      <div class="motor-info">
-        <div class="label">Left</div>
-        <div class="value zero" id="left-val">0</div>
-        <div class="motor-detail">A &amp; C</div>
+    <!-- Servo panel -->
+    <div class="panel">
+      <div class="panel-header">
+        <h2 style="margin: 0;">ST3215 Servos</h2>
+        <div style="display:flex; gap:6px;">
+          <button class="btn" id="rescan-btn">Rescan</button>
+          <button class="btn" id="addid-btn" title="Set ID on a freshly-attached servo (default ID = 1)">Set ID</button>
+        </div>
       </div>
-      <div class="motor-info">
-        <div class="label">Right</div>
-        <div class="value zero" id="right-val">0</div>
-        <div class="motor-detail">B &amp; D</div>
+      <div class="all-row">
+        <label>All</label>
+        <input type="range" id="all-slider" min="0" max="4095" value="2048" />
+        <span class="servo-pos" id="all-val">2048</span>
       </div>
+      <div id="servo-list"></div>
     </div>
 
     <script>
+      const baseUrl = `http://${window.location.host}`;
+      const statusEl = document.getElementById('status');
+
+      // -------------------------------------------------------------------
+      // Joystick
+      // -------------------------------------------------------------------
       const dot = document.getElementById('dot');
       const joystick = document.getElementById('joystick');
-      const statusEl = document.getElementById('status');
       const leftVal = document.getElementById('left-val');
       const rightVal = document.getElementById('right-val');
 
-      const baseUrl = `http://${window.location.host}`;
+      const SEND_INTERVAL_MS = 100;
+      const FETCH_TIMEOUT_MS = 400;
+      const STOP_RETRIES = 3;
 
-      // Timing constants
-      const SEND_INTERVAL_MS = 100; // Send commands at ~10 Hz while active
-      const FETCH_TIMEOUT_MS = 400; // Abort fetch if no response in 400ms
-      const STOP_RETRIES = 3; // Retry stop command this many times
-
-      const radius = 140;
+      const radius = 130;
       let dragging = false;
       let currentLeft = 0;
       let currentRight = 0;
@@ -215,151 +290,89 @@
         const rect = joystick.getBoundingClientRect();
         return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
       }
+      function clamp(v, mn, mx) { return Math.max(mn, Math.min(mx, v)); }
 
-      function clamp(v, min, max) {
-        return Math.max(min, Math.min(max, v));
-      }
-
-      function updateDot(clientX, clientY) {
+      function updateDot(cx, cy) {
         const c = getCenter();
-        let dx = clientX - c.x;
-        let dy = clientY - c.y;
-
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist > radius) {
-          dx = (dx / dist) * radius;
-          dy = (dy / dist) * radius;
-        }
-
+        let dx = cx - c.x, dy = cy - c.y;
+        const d = Math.sqrt(dx*dx + dy*dy);
+        if (d > radius) { dx = dx/d*radius; dy = dy/d*radius; }
         dot.style.left = `calc(50% + ${dx}px)`;
         dot.style.top = `calc(50% + ${dy}px)`;
-
-        const nx = dx / radius;
-        const ny = dy / radius;
-
-        currentLeft = clamp(Math.round((ny + nx) * 100), -100, 100);
+        const nx = dx/radius, ny = -dy/radius; // up = positive
+        currentLeft  = clamp(Math.round((ny + nx) * 100), -100, 100);
         currentRight = clamp(Math.round((ny - nx) * 100), -100, 100);
-
         updateDisplay(currentLeft, currentRight);
       }
-
       function resetDot() {
-        dot.style.left = '50%';
-        dot.style.top = '50%';
-        currentLeft = 0;
-        currentRight = 0;
+        dot.style.left = '50%'; dot.style.top = '50%';
+        currentLeft = 0; currentRight = 0;
         updateDisplay(0, 0);
       }
-
-      function updateDisplay(left, right) {
-        leftVal.textContent = left;
-        rightVal.textContent = right;
-        leftVal.className =
-          'value ' + (left > 0 ? 'pos' : left < 0 ? 'neg' : 'zero');
-        rightVal.className =
-          'value ' + (right > 0 ? 'pos' : right < 0 ? 'neg' : 'zero');
+      function updateDisplay(l, r) {
+        leftVal.textContent = l;
+        rightVal.textContent = r;
+        leftVal.className = 'value ' + (l>0?'pos':l<0?'neg':'zero');
+        rightVal.className = 'value ' + (r>0?'pos':r<0?'neg':'zero');
       }
-
-      // -- Fixed-rate send loop -----------------------------------------
-      // While the joystick is active, fire a command every SEND_INTERVAL_MS.
-      // If the previous request is still in-flight, skip that tick.
-      // This feeds the ESP32 watchdog (500ms) and always sends the latest
-      // joystick values rather than queuing stale ones.
 
       function startSending() {
         if (sendTimer) return;
-        fireCommand(); // immediate first send
+        fireCommand();
         sendTimer = setInterval(fireCommand, SEND_INTERVAL_MS);
       }
-
       function stopSending() {
-        if (sendTimer) {
-          clearInterval(sendTimer);
-          sendTimer = null;
-        }
+        if (sendTimer) { clearInterval(sendTimer); sendTimer = null; }
         sendStopReliably();
       }
-
       function fireCommand() {
-        if (inFlight) return; // previous request still pending — skip this tick
+        if (inFlight) return;
         inFlight = true;
-
-        const abort = new AbortController();
-        const timeout = setTimeout(() => abort.abort(), FETCH_TIMEOUT_MS);
-        const l = currentLeft;
-        const r = currentRight;
-
-        fetch(`${baseUrl}/motors?a=${l}&b=${r}&c=${l}&d=${r}`, {
-          signal: abort.signal,
-        })
-          .then(() => {
-            clearTimeout(timeout);
-            statusEl.textContent = `OK — L:${l} R:${r}`;
-            statusEl.className = 'status ok';
-          })
-          .catch((e) => {
-            clearTimeout(timeout);
-            if (e.name !== 'AbortError') {
-              statusEl.textContent = 'Send error';
-              statusEl.className = 'status err';
-            }
-          })
-          .finally(() => {
-            inFlight = false;
-          });
+        const ab = new AbortController();
+        const t = setTimeout(() => ab.abort(), FETCH_TIMEOUT_MS);
+        const l = currentLeft, r = currentRight;
+        fetch(`${baseUrl}/motors?a=${l}&b=${r}&c=${l}&d=${r}`, { signal: ab.signal })
+          .then(() => { clearTimeout(t); statusEl.textContent = `OK — L:${l} R:${r}`; statusEl.className = 'status ok'; })
+          .catch(e => { clearTimeout(t); if (e.name !== 'AbortError') { statusEl.textContent = 'Send error'; statusEl.className = 'status err'; } })
+          .finally(() => { inFlight = false; });
       }
-
-      // Retry stop command multiple times for reliability.
-      // Even if all retries fail, the ESP32 watchdog will stop motors
-      // within 500ms.
       async function sendStopReliably() {
-        for (let attempt = 0; attempt < STOP_RETRIES; attempt++) {
+        for (let i = 0; i < STOP_RETRIES; i++) {
           try {
             const c = new AbortController();
             const t = setTimeout(() => c.abort(), 500);
-            await fetch(`${baseUrl}/motors?a=0&b=0&c=0&d=0`, {
-              signal: c.signal,
-            });
+            await fetch(`${baseUrl}/motors?a=0&b=0&c=0&d=0`, { signal: c.signal });
             clearTimeout(t);
             statusEl.textContent = 'Stopped';
             statusEl.className = 'status ok';
             return;
           } catch (e) {
-            if (attempt < STOP_RETRIES - 1) {
-              await new Promise((r) => setTimeout(r, 50));
-            }
+            if (i < STOP_RETRIES - 1) await new Promise(r => setTimeout(r, 50));
           }
         }
-        statusEl.textContent = 'Stop retries failed — watchdog will engage';
-        statusEl.className = 'status err';
       }
-
-      // -- Pointer events (mouse + touch unified) -----------------------
 
       function onStart(e) {
         e.preventDefault();
         dragging = true;
         dot.classList.add('active');
-        const pt = e.touches ? e.touches[0] : e;
-        updateDot(pt.clientX, pt.clientY);
+        const p = e.touches ? e.touches[0] : e;
+        updateDot(p.clientX, p.clientY);
         startSending();
       }
-
       function onMove(e) {
         if (!dragging) return;
         e.preventDefault();
-        const pt = e.touches ? e.touches[0] : e;
-        updateDot(pt.clientX, pt.clientY);
+        const p = e.touches ? e.touches[0] : e;
+        updateDot(p.clientX, p.clientY);
       }
-
-      function onEnd(e) {
+      function onEnd() {
         if (!dragging) return;
         dragging = false;
         dot.classList.remove('active');
         resetDot();
         stopSending();
       }
-
       joystick.addEventListener('mousedown', onStart);
       joystick.addEventListener('touchstart', onStart, { passive: false });
       window.addEventListener('mousemove', onMove);
@@ -367,8 +380,6 @@
       window.addEventListener('mouseup', onEnd);
       window.addEventListener('touchend', onEnd);
       window.addEventListener('touchcancel', onEnd);
-
-      // -- Safety: stop motors if browser tab goes hidden ---------------
       document.addEventListener('visibilitychange', () => {
         if (document.hidden && (dragging || sendTimer)) {
           dragging = false;
@@ -378,53 +389,228 @@
         }
       });
 
-      // -- Keyboard fallback — arrow keys -------------------------------
-      const keys = {};
+      // -------------------------------------------------------------------
+      // ST3215 servos
+      // -------------------------------------------------------------------
+      const servoListEl = document.getElementById('servo-list');
+      const rescanBtn = document.getElementById('rescan-btn');
+      const addIdBtn = document.getElementById('addid-btn');
+      const allSlider = document.getElementById('all-slider');
+      const allVal = document.getElementById('all-val');
 
-      window.addEventListener('keydown', (e) => {
-        if (
-          ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)
-        ) {
-          e.preventDefault();
-          const wasIdle = !Object.values(keys).some(Boolean);
-          keys[e.key] = true;
-          updateFromKeys();
-          if (wasIdle) startSending();
+      // Per-servo state: { id -> { posUi, posLive, torque, load, voltage, temp, inFlight, pending } }
+      const servos = new Map();
+
+      function renderServos(ids) {
+        servoListEl.innerHTML = '';
+        if (!ids || ids.length === 0) {
+          servoListEl.innerHTML = '<div class="empty">No servos found. Connect a servo and click Rescan.</div>';
+          return;
         }
+        // Drop state for servos that disappeared
+        for (const id of [...servos.keys()]) {
+          if (!ids.includes(id)) servos.delete(id);
+        }
+        for (const id of ids) {
+          if (!servos.has(id)) {
+            servos.set(id, { posUi: 2048, posLive: 0, torque: true, load: 0, voltage: 0, temp: 0, inFlight: false, pending: null });
+          }
+          servoListEl.appendChild(buildCard(id));
+        }
+      }
+
+      function buildCard(id) {
+        const s = servos.get(id);
+        const card = document.createElement('div');
+        card.className = 'servo-card';
+        card.dataset.id = id;
+        card.innerHTML = `
+          <div class="servo-head">
+            <div class="servo-id">#${id}</div>
+            <div class="servo-actions">
+              <button class="btn" data-act="torque">${s.torque ? 'Disable Torque' : 'Enable Torque'}</button>
+              <button class="btn" data-act="center">Center</button>
+              <button class="btn" data-act="ping">Ping</button>
+              <button class="btn danger" data-act="setid">Set ID…</button>
+            </div>
+          </div>
+          <div class="servo-row">
+            <input type="range" min="0" max="4095" value="${s.posUi}" data-role="slider" />
+            <span class="servo-pos" data-role="ui">${s.posUi}</span>
+          </div>
+          <div class="servo-meta">
+            <div><span class="k">pos</span><span data-role="pos">--</span></div>
+            <div><span class="k">load</span><span data-role="load">--</span></div>
+            <div><span class="k">V/T</span><span data-role="vt">--</span></div>
+          </div>
+        `;
+
+        const slider = card.querySelector('[data-role=slider]');
+        const uiEl = card.querySelector('[data-role=ui]');
+        slider.addEventListener('input', () => {
+          s.posUi = parseInt(slider.value, 10);
+          uiEl.textContent = s.posUi;
+          throttledMove(id, s.posUi);
+        });
+
+        card.querySelectorAll('.servo-actions .btn').forEach(b => {
+          b.addEventListener('click', () => onServoAction(id, b.dataset.act));
+        });
+
+        return card;
+      }
+
+      function throttledMove(id, pos) {
+        const s = servos.get(id);
+        if (!s) return;
+        if (s.inFlight) { s.pending = pos; return; }
+        sendMove(id, pos);
+      }
+      function sendMove(id, pos) {
+        const s = servos.get(id);
+        s.inFlight = true;
+        fetch(`${baseUrl}/st/${id}/pos/${pos}?speed=2000&acc=50`)
+          .catch(() => {})
+          .finally(() => {
+            s.inFlight = false;
+            if (s.pending != null) {
+              const p = s.pending; s.pending = null;
+              sendMove(id, p);
+            }
+          });
+      }
+
+      function onServoAction(id, act) {
+        const s = servos.get(id);
+        if (act === 'torque') {
+          const next = !s.torque;
+          fetch(`${baseUrl}/st/${id}/torque/${next ? 1 : 0}`)
+            .then(() => { s.torque = next; refreshButtons(id); })
+            .catch(() => {});
+        } else if (act === 'center') {
+          s.posUi = 2048;
+          const card = servoListEl.querySelector(`.servo-card[data-id="${id}"]`);
+          if (card) {
+            card.querySelector('[data-role=slider]').value = '2048';
+            card.querySelector('[data-role=ui]').textContent = '2048';
+          }
+          sendMove(id, 2048);
+        } else if (act === 'ping') {
+          fetch(`${baseUrl}/st/${id}/ping`).then(r => r.json()).then(d => {
+            statusEl.textContent = d.ok ? `Ping #${id} OK` : `Ping #${id}: ${d.error || 'err'}`;
+            statusEl.className = 'status ' + (d.ok ? 'ok' : 'err');
+          }).catch(() => {});
+        } else if (act === 'setid') {
+          const v = prompt(`Change servo #${id} to new ID (1-253):`, String(id));
+          if (!v) return;
+          const n = parseInt(v, 10);
+          if (!Number.isInteger(n) || n < 1 || n > 253) {
+            alert('ID must be 1-253'); return;
+          }
+          fetch(`${baseUrl}/st/${id}/id/${n}`).then(() => {
+            setTimeout(loadList, 500); // backend auto-rescans
+          });
+        }
+      }
+
+      function refreshButtons(id) {
+        const s = servos.get(id);
+        const card = servoListEl.querySelector(`.servo-card[data-id="${id}"]`);
+        if (!card) return;
+        const btn = card.querySelector('.btn[data-act=torque]');
+        if (btn) btn.textContent = s.torque ? 'Disable Torque' : 'Enable Torque';
+      }
+
+      function loadList() {
+        fetch(`${baseUrl}/st/list`).then(r => r.json()).then(d => {
+          renderServos(d.ids || []);
+        }).catch(() => {});
+      }
+
+      rescanBtn.addEventListener('click', () => {
+        rescanBtn.disabled = true;
+        fetch(`${baseUrl}/st/scan?from=1&to=20`)
+          .finally(() => { setTimeout(() => { rescanBtn.disabled = false; loadList(); }, 600); });
       });
 
-      window.addEventListener('keyup', (e) => {
-        if (
-          ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)
-        ) {
-          keys[e.key] = false;
-          updateFromKeys();
-          if (!Object.values(keys).some(Boolean)) {
-            resetDot();
-            stopSending();
+      addIdBtn.addEventListener('click', () => {
+        const cur = prompt('Current ID of the freshly-attached servo (factory default = 1):', '1');
+        if (!cur) return;
+        const c = parseInt(cur, 10);
+        const nxt = prompt(`Change ID ${c} to:`);
+        if (!nxt) return;
+        const n = parseInt(nxt, 10);
+        if (!Number.isInteger(c) || !Number.isInteger(n) || n < 1 || n > 253) {
+          alert('IDs must be integers; new ID 1-253'); return;
+        }
+        fetch(`${baseUrl}/st/${c}/id/${n}`).then(() => {
+          setTimeout(loadList, 500);
+        });
+      });
+
+      // -- All-servos slider (SYNC_WRITE) -------------------------------
+      let allInFlight = false, allPending = null;
+      allSlider.addEventListener('input', () => {
+        const v = parseInt(allSlider.value, 10);
+        allVal.textContent = v;
+        // Mirror onto every card UI for instant feedback
+        for (const [id, s] of servos.entries()) {
+          s.posUi = v;
+          const card = servoListEl.querySelector(`.servo-card[data-id="${id}"]`);
+          if (card) {
+            card.querySelector('[data-role=slider]').value = String(v);
+            card.querySelector('[data-role=ui]').textContent = String(v);
           }
         }
+        sendAll(v);
       });
-
-      function updateFromKeys() {
-        let y = 0,
-          x = 0;
-        if (keys['ArrowUp']) y += 1;
-        if (keys['ArrowDown']) y -= 1;
-        if (keys['ArrowRight']) x += 1;
-        if (keys['ArrowLeft']) x -= 1;
-
-        currentLeft = clamp(Math.round((y + x) * 100), -100, 100);
-        currentRight = clamp(Math.round((y - x) * 100), -100, 100);
-
-        dot.style.left = `calc(50% + ${x * radius}px)`;
-        dot.style.top = `calc(50% + ${-y * radius}px)`;
-
-        updateDisplay(currentLeft, currentRight);
+      function sendAll(v) {
+        if (allInFlight) { allPending = v; return; }
+        const ids = [...servos.keys()];
+        if (ids.length === 0) return;
+        const q = ids.map(id => `${id}=${v}`).join('&');
+        allInFlight = true;
+        fetch(`${baseUrl}/st/all?${q}&speed=2000&acc=50`)
+          .catch(() => {})
+          .finally(() => {
+            allInFlight = false;
+            if (allPending != null) {
+              const p = allPending; allPending = null;
+              sendAll(p);
+            }
+          });
       }
+
+      // -- State polling -------------------------------------------------
+      let stateInFlight = false;
+      async function pollState() {
+        if (stateInFlight) return;
+        if (servos.size === 0) return;
+        stateInFlight = true;
+        try {
+          const r = await fetch(`${baseUrl}/st/state`);
+          const d = await r.json();
+          for (const e of d.servos || []) {
+            const s = servos.get(e.id);
+            if (!s || e.error) continue;
+            s.posLive = e.pos;
+            s.load = e.load;
+            s.voltage = e.voltage;
+            s.temp = e.temp;
+            const card = servoListEl.querySelector(`.servo-card[data-id="${e.id}"]`);
+            if (card) {
+              card.querySelector('[data-role=pos]').textContent = e.pos;
+              card.querySelector('[data-role=load]').textContent = e.load;
+              card.querySelector('[data-role=vt]').textContent =
+                `${(e.voltage/10).toFixed(1)}V ${e.temp}°C`;
+            }
+          }
+        } catch (e) {} finally { stateInFlight = false; }
+      }
+      setInterval(pollState, 500);
+
       // -- Battery polling ----------------------------------------------
       const batteryEl = document.getElementById('battery');
-
       async function pollBattery() {
         try {
           const c = new AbortController();
@@ -435,13 +621,12 @@
           const pct = data.percentage;
           const v = data.voltage;
           batteryEl.textContent = `${pct}% \u00B7 ${v}V`;
-          batteryEl.className =
-            'battery ' + (pct > 50 ? 'high' : pct > 20 ? 'mid' : 'low');
-        } catch (e) {
-          // silent — battery display just stays stale
-        }
+          batteryEl.className = 'battery ' + (pct > 50 ? 'high' : pct > 20 ? 'mid' : 'low');
+        } catch (e) {}
       }
 
+      // -- Boot ---------------------------------------------------------
+      loadList();
       pollBattery();
       setInterval(pollBattery, 5000);
     </script>

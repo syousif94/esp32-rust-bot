@@ -1,26 +1,22 @@
 //! OLED Display module for 128x64 I2C SSD1306 display
-//! 
+//!
 //! Displays WiFi network, IP address, and motor power levels.
 
+use core::fmt::Write;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::watch::{Watch, Sender};
+use embassy_sync::watch::{Sender, Watch};
 use embassy_time::{Duration, Timer};
-use esp_hal::i2c::master::I2c;
-use esp_hal::Blocking;
-use esp_println::println;
-use ssd1306::{
-    prelude::*,
-    I2CDisplayInterface,
-    Ssd1306,
-};
 use embedded_graphics::{
     geometry::Size,
-    mono_font::{ascii::FONT_6X10, MonoTextStyleBuilder},
+    mono_font::{MonoTextStyleBuilder, ascii::FONT_6X10},
     pixelcolor::BinaryColor,
     prelude::*,
     text::Text,
 };
-use core::fmt::Write;
+use esp_hal::Blocking;
+use esp_hal::i2c::master::I2c;
+use esp_println::println;
+use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
 
 /// Number of receivers for Watch
 const WATCH_RECEIVERS: usize = 2;
@@ -29,7 +25,8 @@ const WATCH_RECEIVERS: usize = 2;
 pub type DisplaySender = Sender<'static, CriticalSectionRawMutex, DisplayState, WATCH_RECEIVERS>;
 
 /// Watch for sharing display state across tasks
-pub static DISPLAY_STATE: Watch<CriticalSectionRawMutex, DisplayState, WATCH_RECEIVERS> = Watch::new();
+pub static DISPLAY_STATE: Watch<CriticalSectionRawMutex, DisplayState, WATCH_RECEIVERS> =
+    Watch::new();
 
 /// WiFi connection status for display
 #[derive(Clone, Copy, Default)]
@@ -208,57 +205,58 @@ pub fn set_line1_override(sender: &DisplaySender, msg: &str) {
 #[embassy_executor::task]
 pub async fn display_task(i2c: I2c<'static, Blocking>) {
     println!("Starting OLED display task...");
-    
+
     // Create display interface
     let interface = I2CDisplayInterface::new(i2c);
-    
+
     // Initialize display (128x64, I2C address 0x3C is default)
     let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
         .into_buffered_graphics_mode();
-    
+
     if let Err(e) = display.init() {
         println!("Failed to initialize display: {:?}", e);
         return;
     }
-    
+
     // Turn on the display explicitly
     if let Err(e) = display.set_display_on(true) {
         println!("Failed to turn on display: {:?}", e);
     }
-    
+
     // Clear the display
     display.clear_buffer();
     if let Err(e) = display.flush() {
         println!("Failed to flush display: {:?}", e);
         return;
     }
-    
+
     println!("OLED display initialized and cleared");
-    
+
     // Create text style
     let text_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
         .text_color(BinaryColor::On)
         .build();
-    
+
     // Get a receiver for display state updates
     let mut receiver = DISPLAY_STATE.receiver().unwrap();
-    
+
     // Buffer for formatting text
     let mut line_buf: heapless::String<32> = heapless::String::new();
-    
+
     // Wait for initial state to be available
     let mut state = receiver.changed().await;
-    
+
     loop {
-        
         // Clear display buffer
         display.clear_buffer();
-        
+
         // Line 1: WiFi SSID or temporary override (BLE connection, etc.)
         line_buf.clear();
         if state.line1_ticks > 0 {
-            let override_msg = core::str::from_utf8(&state.line1_override[..state.line1_override_len as usize]).unwrap_or("");
+            let override_msg =
+                core::str::from_utf8(&state.line1_override[..state.line1_override_len as usize])
+                    .unwrap_or("");
             let _ = write!(line_buf, "{}", override_msg);
             // Decrement line1 ticks
             DISPLAY_STATE.sender().send_modify(|s| {
@@ -268,16 +266,23 @@ pub async fn display_task(i2c: I2c<'static, Blocking>) {
             });
         } else {
             let ssid = core::str::from_utf8(&state.ssid[..state.ssid_len as usize]).unwrap_or("");
-            let _ = write!(line_buf, "WiFi: {}", if ssid.len() > 15 { &ssid[..15] } else { ssid });
+            let _ = write!(
+                line_buf,
+                "WiFi: {}",
+                if ssid.len() > 15 { &ssid[..15] } else { ssid }
+            );
         }
         let _ = Text::new(&line_buf, Point::new(0, 10), text_style).draw(&mut display);
-        
+
         // Line 2: IP Address
         line_buf.clear();
         match state.status {
             WifiStatus::Connected => {
-                let _ = write!(line_buf, "IP: {}.{}.{}.{}", 
-                    state.ip[0], state.ip[1], state.ip[2], state.ip[3]);
+                let _ = write!(
+                    line_buf,
+                    "IP: {}.{}.{}.{}",
+                    state.ip[0], state.ip[1], state.ip[2], state.ip[3]
+                );
             }
             _ => {
                 let dots = match state.dots % 4 {
@@ -295,12 +300,12 @@ pub async fn display_task(i2c: I2c<'static, Blocking>) {
             }
         }
         let _ = Text::new(&line_buf, Point::new(0, 24), text_style).draw(&mut display);
-        
+
         // Line 3: Motors A & B
         line_buf.clear();
         let _ = write!(line_buf, "A:{:+4}% B:{:+4}%", state.motor_a, state.motor_b);
         let _ = Text::new(&line_buf, Point::new(0, 42), text_style).draw(&mut display);
-        
+
         // Line 4: Motors C & D (four_motor only)
         #[cfg(feature = "four_motor")]
         {
@@ -308,20 +313,25 @@ pub async fn display_task(i2c: I2c<'static, Blocking>) {
             let _ = write!(line_buf, "C:{:+4}% D:{:+4}%", state.motor_c, state.motor_d);
             let _ = Text::new(&line_buf, Point::new(0, 56), text_style).draw(&mut display);
         }
-        
+
         // Flash message overlay (centered banner)
         if state.flash_ticks > 0 {
-            let msg = core::str::from_utf8(&state.flash_message[..state.flash_message_len as usize]).unwrap_or("");
+            let msg =
+                core::str::from_utf8(&state.flash_message[..state.flash_message_len as usize])
+                    .unwrap_or("");
             // Center the message horizontally (6px per char on 128px wide display)
             let x = ((128i32 - (msg.len() as i32) * 6) / 2).max(0);
             // Draw a blank band in the middle of the screen then the text
-            use embedded_graphics::primitives::{Rectangle, PrimitiveStyle};
+            use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
             let _ = Rectangle::new(Point::new(0, 24), Size::new(128, 16))
                 .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
                 .draw(&mut display);
-            let _ = Rectangle::new(Point::new(x - 2, 24), Size::new((msg.len() as u32) * 6 + 4, 16))
-                .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
-                .draw(&mut display);
+            let _ = Rectangle::new(
+                Point::new(x - 2, 24),
+                Size::new((msg.len() as u32) * 6 + 4, 16),
+            )
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(&mut display);
             let inverted_style = MonoTextStyleBuilder::new()
                 .font(&FONT_6X10)
                 .text_color(BinaryColor::Off)
@@ -338,12 +348,14 @@ pub async fn display_task(i2c: I2c<'static, Blocking>) {
 
         // Flush buffer to display
         let _ = display.flush();
-        
+
         // Wait for state change or timeout (update at least every 500ms)
         match embassy_futures::select::select(
             receiver.changed(),
             Timer::after(Duration::from_millis(500)),
-        ).await {
+        )
+        .await
+        {
             embassy_futures::select::Either::First(new_state) => {
                 state = new_state;
             }

@@ -1,7 +1,7 @@
 [package]
 edition      = "2024"
 name         = "esp32-http-servo"
-rust-version = "1.88"
+rust-version = "1.93"
 version      = "0.1.0"
 
 [[bin]]
@@ -17,7 +17,7 @@ esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32"] }
 critical-section = "1.2.0"
 esp-radio = { version = "0.17.0", features = ["esp32", "wifi", "smoltcp", "unstable", "ble", "coex"] }
 esp-rtos = { version = "0.2.0", features = ["embassy", "esp32", "esp-radio"] }
-embassy-net = { version = "0.7.1", features = ["tcp", "udp", "dhcpv4", "medium-ethernet"] }
+embassy-net = { version = "0.8.0", features = ["tcp", "udp", "dhcpv4", "medium-ethernet"] }
 esp-println = { version = "0.16.1", features = ["esp32", "log-04"] }
 esp-alloc = "0.9.0"
 esp-backtrace = { version = "0.18.1", features = ["esp32", "panic-handler", "println"] }

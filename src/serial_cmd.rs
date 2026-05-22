@@ -1,63 +1,42 @@
-use esp_println::println;
-use esp_hal::uart::Uart;
-use esp_hal::Blocking;
+//! Serial console command interface.
+//!
+//! Grammar:
+//!   m <power>                       — set ALL motors to power
+//!   ma <power> | mb <power>         — set Motor A / B (-100..=100)
+//!   mc <power> | md <power>         — Motor C / D (four_motor only)
+//!   motor <a|b|c|d> <power>         — verbose form
+//!   st list                        — print discovered servo IDs
+//!   st scan [from to]              — re-scan the bus
+//!   st all <id>=<pos> ...          — atomic sync_write move
+//!     [speed <s>] [acc <a>]
+//!   st <id> pos <v>                — move servo to pos 0..=4095
+//!     [speed <s>] [acc <a>]         (alias: st <id> p <v>)
+//!   st <id> torque <0|1>           — enable/disable torque (alias t)
+//!   st <id> setid <new>            — change servo ID (auto-rescans)
+//!   st <id> ping                   — ping a single servo
+//!   st <id> state                  — read pos/speed/load/V/T
+
 use embassy_time::{Duration, Timer};
-use crate::commands::{Command, MotorId, send_command, MOTOR_COUNT};
+use esp_hal::Blocking;
+use esp_hal::uart::Uart;
+use esp_println::println;
 
-/// Parsed command from serial input
-enum SerialCommand {
-    Servo(u8),
-    MotorA(i8),
-    MotorB(i8),
-    #[cfg(feature = "four_motor")]
-    MotorC(i8),
-    #[cfg(feature = "four_motor")]
-    MotorD(i8),
-    MotorAll(i8),
-}
+use crate::commands::{Command, MOTOR_COUNT, MotorId, send_command};
+use crate::st3215::MAX_SERVOS;
 
-/// Parse a servo command from input
-/// Accepts formats like: "90", "servo 90", "angle 90", "s90", "a90"
-fn parse_servo_command(input: &str) -> Option<u8> {
+const ST_DEFAULT_SPEED: u16 = 1500;
+const ST_DEFAULT_ACC: u8 = 50;
+const ST_MAX_POS: u16 = 4095;
+
+fn parse_motor_token(input: &str) -> Option<(char, i8)> {
     let input = input.trim();
-    
-    // Try direct number (only positive, for servo)
-    if let Ok(angle) = input.parse::<u8>() {
-        if angle <= 180 {
-            return Some(angle);
-        }
-    }
-    
-    // Try "servo X" or "s X" or "sX"
-    for prefix in ["servo ", "angle ", "s ", "a ", "s", "a"] {
-        if let Some(rest) = input.strip_prefix(prefix) {
-            if let Ok(angle) = rest.trim().parse::<u8>() {
-                if angle <= 180 {
-                    return Some(angle);
-                }
-            }
-        }
-    }
-    
-    None
-}
-
-/// Parse a motor command from input
-/// Accepts formats like: "ma 50", "mb -75", "mc 100", "md -50", "motor a 100", "motor b -50", "m 50" (all motors)
-fn parse_motor_command(input: &str) -> Option<(char, i8)> {
-    let input = input.trim().to_lowercase();
-    
-    // Try "m X" format for all motors (must check before "ma"/"mb"/"mc"/"md")
-    // Make sure it's not "ma", "mb", "mc", or "md"
     if let Some(rest) = input.strip_prefix("m ") {
         if let Ok(power) = rest.trim().parse::<i8>() {
-            if power >= -100 && power <= 100 {
-                return Some(('*', power)); // '*' means all motors
+            if (-100..=100).contains(&power) {
+                return Some(('*', power));
             }
         }
     }
-    
-    // Try "ma X", "mb X", "mc X", "md X" format
     #[cfg(feature = "four_motor")]
     let motor_prefixes: &[(&str, char)] = &[("ma ", 'a'), ("mb ", 'b'), ("mc ", 'c'), ("md ", 'd')];
     #[cfg(feature = "two_motor")]
@@ -65,124 +44,288 @@ fn parse_motor_command(input: &str) -> Option<(char, i8)> {
     for &(prefix, motor_id) in motor_prefixes {
         if let Some(rest) = input.strip_prefix(prefix) {
             if let Ok(power) = rest.trim().parse::<i8>() {
-                if power >= -100 && power <= 100 {
+                if (-100..=100).contains(&power) {
                     return Some((motor_id, power));
                 }
             }
         }
     }
-    
-    // Try "motor a X", "motor b X", "motor c X", "motor d X" format
     if let Some(rest) = input.strip_prefix("motor ") {
         let rest = rest.trim();
         #[cfg(feature = "four_motor")]
-        let motor_prefixes: &[(&str, char)] = &[("a ", 'a'), ("b ", 'b'), ("c ", 'c'), ("d ", 'd')];
+        let inner: &[(&str, char)] = &[("a ", 'a'), ("b ", 'b'), ("c ", 'c'), ("d ", 'd')];
         #[cfg(feature = "two_motor")]
-        let motor_prefixes: &[(&str, char)] = &[("a ", 'a'), ("b ", 'b')];
-        for &(prefix, motor_id) in motor_prefixes {
+        let inner: &[(&str, char)] = &[("a ", 'a'), ("b ", 'b')];
+        for &(prefix, motor_id) in inner {
             if let Some(power_str) = rest.strip_prefix(prefix) {
                 if let Ok(power) = power_str.trim().parse::<i8>() {
-                    if power >= -100 && power <= 100 {
+                    if (-100..=100).contains(&power) {
                         return Some((motor_id, power));
                     }
                 }
             }
         }
     }
-    
     None
 }
 
-/// Parse any serial command
-fn parse_command(input: &str) -> Option<SerialCommand> {
-    // Try motor command first (to avoid "ma" being parsed as servo)
-    if let Some((motor, power)) = parse_motor_command(input) {
-        return match motor {
-            'a' => Some(SerialCommand::MotorA(power)),
-            'b' => Some(SerialCommand::MotorB(power)),
-            #[cfg(feature = "four_motor")]
-            'c' => Some(SerialCommand::MotorC(power)),
-            #[cfg(feature = "four_motor")]
-            'd' => Some(SerialCommand::MotorD(power)),
-            '*' => Some(SerialCommand::MotorAll(power)),
-            _ => None,
-        };
+/// Tokenize on whitespace, max 32 tokens.
+fn tokens(input: &str) -> heapless::Vec<&str, 32> {
+    let mut v: heapless::Vec<&str, 32> = heapless::Vec::new();
+    for tok in input.split_whitespace() {
+        if v.push(tok).is_err() {
+            break;
+        }
     }
-    
-    // Try servo command
-    if let Some(angle) = parse_servo_command(input) {
-        return Some(SerialCommand::Servo(angle));
-    }
-    
-    None
+    v
 }
 
-/// Task to read serial input and parse servo/motor commands
+/// Parse and dispatch an `st ...` subcommand. Returns `true` if recognized.
+fn parse_st(input: &str) -> bool {
+    let Some(rest) = input.trim().strip_prefix("st") else {
+        return false;
+    };
+    let rest = rest.trim();
+    let toks = tokens(rest);
+    let tcount = toks.len();
+    if tcount == 0 {
+        println!("usage: st list | scan [from to] | all <id>=<pos> ... | <id> <op> ...");
+        return true;
+    }
+
+    match toks[0] {
+        "list" => {
+            send_command(Command::St3215Rescan { from: 1, to: 20 });
+            println!("Serial: rescanning bus (list will print in main loop)");
+            return true;
+        }
+        "scan" => {
+            let from = toks.get(1).and_then(|s| s.parse().ok()).unwrap_or(1u8);
+            let to = toks.get(2).and_then(|s| s.parse().ok()).unwrap_or(20u8);
+            send_command(Command::St3215Rescan { from, to });
+            println!("Serial: scan {}..={}", from, to);
+            return true;
+        }
+        "all" => {
+            // st all 1=2048 2=1024 [speed 1500] [acc 50]
+            let mut moves: [(u8, u16); MAX_SERVOS] = [(0, 0); MAX_SERVOS];
+            let mut count = 0u8;
+            let mut speed = ST_DEFAULT_SPEED;
+            let mut acc = ST_DEFAULT_ACC;
+            let mut i = 1;
+            while i < tcount {
+                let tok = toks[i];
+                if tok == "speed" {
+                    if let Some(v) = toks.get(i + 1).and_then(|s| s.parse().ok()) {
+                        speed = v;
+                        i += 2;
+                        continue;
+                    }
+                } else if tok == "acc" {
+                    if let Some(v) = toks.get(i + 1).and_then(|s| s.parse().ok()) {
+                        acc = v;
+                        i += 2;
+                        continue;
+                    }
+                } else if let Some((id_s, pos_s)) = tok.split_once('=') {
+                    if let (Ok(id), Ok(pos)) = (id_s.parse::<u8>(), pos_s.parse::<u16>()) {
+                        if pos <= ST_MAX_POS && (count as usize) < MAX_SERVOS {
+                            moves[count as usize] = (id, pos);
+                            count += 1;
+                        }
+                    }
+                }
+                i += 1;
+            }
+            if count == 0 {
+                println!("usage: st all <id>=<pos> ... [speed <s>] [acc <a>]");
+                return true;
+            }
+            send_command(Command::St3215MoveAll {
+                count,
+                moves,
+                speed,
+                acc,
+            });
+            println!(
+                "Serial: st all {} moves @ speed={} acc={}",
+                count, speed, acc
+            );
+            return true;
+        }
+        _ => {}
+    }
+
+    // st <id> <op> ...
+    let Ok(id) = toks[0].parse::<u8>() else {
+        println!("Unknown st subcommand: '{}'", toks[0]);
+        return true;
+    };
+    if tcount < 2 {
+        println!("usage: st <id> <pos|p|torque|t|setid|ping|state> ...");
+        return true;
+    }
+    match toks[1] {
+        "pos" | "p" => {
+            let Some(pos) = toks.get(2).and_then(|s| s.parse::<u16>().ok()) else {
+                println!("usage: st <id> pos <0..=4095> [speed <s>] [acc <a>]");
+                return true;
+            };
+            if pos > ST_MAX_POS {
+                println!("pos must be 0..=4095");
+                return true;
+            }
+            let mut speed = ST_DEFAULT_SPEED;
+            let mut acc = ST_DEFAULT_ACC;
+            let mut i = 3;
+            while i < tcount {
+                match toks[i] {
+                    "speed" => {
+                        if let Some(v) = toks.get(i + 1).and_then(|s| s.parse().ok()) {
+                            speed = v;
+                        }
+                        i += 2;
+                    }
+                    "acc" => {
+                        if let Some(v) = toks.get(i + 1).and_then(|s| s.parse().ok()) {
+                            acc = v;
+                        }
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            send_command(Command::St3215Move {
+                id,
+                pos,
+                speed,
+                acc,
+            });
+            println!("Serial: st {} pos={} speed={} acc={}", id, pos, speed, acc);
+        }
+        "torque" | "t" => {
+            let Some(v) = toks.get(2) else {
+                println!("usage: st <id> torque <0|1>");
+                return true;
+            };
+            let enable = matches!(*v, "1" | "on" | "true");
+            send_command(Command::St3215Torque { id, enable });
+            println!("Serial: st {} torque={}", id, enable);
+        }
+        "setid" => {
+            let Some(new) = toks.get(2).and_then(|s| s.parse::<u8>().ok()) else {
+                println!("usage: st <id> setid <new>");
+                return true;
+            };
+            if !(1..=253).contains(&new) {
+                println!("new id must be 1..=253");
+                return true;
+            }
+            send_command(Command::St3215SetId { current: id, new });
+            println!("Serial: st {} setid {} (rescan will follow)", id, new);
+        }
+        "ping" => {
+            send_command(Command::St3215Ping { id });
+            println!("Serial: st {} ping", id);
+        }
+        "state" => {
+            // Routed via HTTP/BLE for sync reads; serial just pings to log presence.
+            send_command(Command::St3215Ping { id });
+            println!(
+                "Serial: st {} ping (use HTTP /st/{}/state for full state)",
+                id, id
+            );
+        }
+        other => {
+            println!("Unknown st op: '{}'", other);
+        }
+    }
+    true
+}
+
+fn dispatch(cmd: &str) {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return;
+    }
+
+    // Try motor commands first
+    if let Some((motor, power)) = parse_motor_token(cmd) {
+        match motor {
+            'a' => {
+                println!("\nSerial: Motor A = {}%", power);
+                send_command(Command::Motor(MotorId::A, power));
+            }
+            'b' => {
+                println!("\nSerial: Motor B = {}%", power);
+                send_command(Command::Motor(MotorId::B, power));
+            }
+            #[cfg(feature = "four_motor")]
+            'c' => {
+                println!("\nSerial: Motor C = {}%", power);
+                send_command(Command::Motor(MotorId::C, power));
+            }
+            #[cfg(feature = "four_motor")]
+            'd' => {
+                println!("\nSerial: Motor D = {}%", power);
+                send_command(Command::Motor(MotorId::D, power));
+            }
+            '*' => {
+                println!("\nSerial: All motors = {}%", power);
+                send_command(Command::MotorsAll([power; MOTOR_COUNT]));
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if parse_st(cmd) {
+        return;
+    }
+
+    println!("\nUnknown command: '{}'", cmd);
+    println!(
+        "  Motors: m <p>, ma/mb{} <p>",
+        if cfg!(feature = "four_motor") {
+            "/mc/md"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "  Servos: st list | st scan | st all <id>=<pos> ... | st <id> pos <v> | st <id> torque <0|1> | st <id> setid <new> | st <id> ping"
+    );
+}
+
 #[embassy_executor::task]
 pub async fn serial_input_task(mut uart: Uart<'static, Blocking>) {
     println!("Serial command interface ready");
-    println!("  Servo:  <angle> or 'servo <angle>' (0-180)");
-    #[cfg(feature = "four_motor")]
-    println!("  Motor:  'm <power>' (all), 'ma/mb/mc/md <power>' (-100 to 100)");
-    #[cfg(feature = "two_motor")]
-    println!("  Motor:  'm <power>' (all), 'ma/mb <power>' (-100 to 100)");
-    #[cfg(feature = "four_motor")]
-    println!("  Examples: 90, m 50, ma 75, mb -50, mc 100, md -25");
-    #[cfg(feature = "two_motor")]
-    println!("  Examples: 90, m 50, ma 75, mb -50");
-    
-    let mut buffer = [0u8; 64];
+    println!(
+        "  Motors: m <p>, ma/mb{} <p>",
+        if cfg!(feature = "four_motor") {
+            "/mc/md"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "  Servos: st list | st scan | st all <id>=<pos> ... | st <id> pos <v> | st <id> torque <0|1> | st <id> setid <new> | st <id> ping"
+    );
+
+    let mut buffer = [0u8; 96];
     let mut pos = 0usize;
     let mut read_buf = [0u8; 1];
-    
+
     loop {
-        // Check if data is available (non-blocking check)
         if uart.read_ready() {
-            // Try to read a byte
             match uart.read(&mut read_buf) {
                 Ok(1) => {
                     let byte = read_buf[0];
-                    
-                    // Echo the character back
                     let _ = uart.write(&[byte]);
-                    
                     if byte == b'\r' || byte == b'\n' {
                         if pos > 0 {
-                            // Try to parse the command
                             if let Ok(cmd) = core::str::from_utf8(&buffer[..pos]) {
-                                match parse_command(cmd) {
-                                    Some(SerialCommand::Servo(angle)) => {
-                                        println!("\nSerial: Setting servo to {} degrees", angle);
-                                        send_command(Command::Servo(angle));
-                                    }
-                                    Some(SerialCommand::MotorA(power)) => {
-                                        println!("\nSerial: Setting motor A to {}%", power);
-                                        send_command(Command::Motor(MotorId::A, power));
-                                    }
-                                    Some(SerialCommand::MotorB(power)) => {
-                                        println!("\nSerial: Setting motor B to {}%", power);
-                                        send_command(Command::Motor(MotorId::B, power));
-                                    }
-                                    #[cfg(feature = "four_motor")]
-                                    Some(SerialCommand::MotorC(power)) => {
-                                        println!("\nSerial: Setting motor C to {}%", power);
-                                        send_command(Command::Motor(MotorId::C, power));
-                                    }
-                                    #[cfg(feature = "four_motor")]
-                                    Some(SerialCommand::MotorD(power)) => {
-                                        println!("\nSerial: Setting motor D to {}%", power);
-                                        send_command(Command::Motor(MotorId::D, power));
-                                    }
-                                    Some(SerialCommand::MotorAll(power)) => {
-                                        println!("\nSerial: Setting all motors to {}%", power);
-                                        send_command(Command::MotorsAll([power; MOTOR_COUNT]));
-                                    }
-                                    None => {
-                                        if !cmd.trim().is_empty() {
-                                            println!("\nUnknown command: '{}'. Use 0-180 for servo, 'm/ma/mb/mc/md <-100 to 100>' for motors.", cmd);
-                                        }
-                                    }
-                                }
+                                dispatch(cmd);
                             }
                             pos = 0;
                         }
@@ -195,7 +338,6 @@ pub async fn serial_input_task(mut uart: Uart<'static, Blocking>) {
                 _ => {}
             }
         } else {
-            // No data available, yield to other tasks
             Timer::after(Duration::from_millis(10)).await;
         }
     }

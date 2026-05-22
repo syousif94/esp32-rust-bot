@@ -5,7 +5,7 @@
 
 use core::pin::pin;
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_net::Runner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
@@ -18,11 +18,13 @@ use esp_storage::FlashStorage;
 
 use crate::ble::BLE_WIFI_CREDENTIALS;
 use crate::display::{
-    update_dots, update_ip, update_ssid, update_status, set_line1_override,
-    DisplaySender, WifiStatus,
+    DisplaySender, WifiStatus, set_line1_override, update_dots, update_ip, update_ssid,
+    update_status,
 };
 use crate::http_server::http_server_task;
-use crate::wifi_config::{read_wifi_credentials, write_wifi_credentials, MAX_SSID_LEN, MAX_PASSWORD_LEN};
+use crate::wifi_config::{
+    MAX_PASSWORD_LEN, MAX_SSID_LEN, read_wifi_credentials, write_wifi_credentials,
+};
 
 /// Compile-time default WiFi credentials (from cfg.toml / environment)
 const SSID: &str = env!("WIFI_SSID");
@@ -32,7 +34,10 @@ const PASSWORD: &str = env!("WIFI_PASSWORD");
 /// Contains (ssid, password) as heapless strings.
 pub static WIFI_RECONNECT: Signal<
     CriticalSectionRawMutex,
-    (heapless::String<MAX_SSID_LEN>, heapless::String<MAX_PASSWORD_LEN>),
+    (
+        heapless::String<MAX_SSID_LEN>,
+        heapless::String<MAX_PASSWORD_LEN>,
+    ),
 > = Signal::new();
 
 /// Return the compile-time default SSID (for display init, etc.)
@@ -55,7 +60,10 @@ pub async fn wifi_config_task(
 ) {
     // Check for stored credentials at startup and signal connection task
     if let Some(creds) = read_wifi_credentials(flash_storage) {
-        println!("[WiFi Config] Found stored credentials: SSID='{}'", creds.ssid.as_str());
+        println!(
+            "[WiFi Config] Found stored credentials: SSID='{}'",
+            creds.ssid.as_str()
+        );
         update_ssid(&display_sender, creds.ssid.as_str());
         WIFI_RECONNECT.signal((creds.ssid, creds.password));
     }
@@ -63,17 +71,27 @@ pub async fn wifi_config_task(
     loop {
         // Wait for WiFi credentials from BLE
         let (ssid, password) = BLE_WIFI_CREDENTIALS.wait().await;
-        println!("[WiFi Config] Received WiFi credentials via BLE: SSID='{}'", ssid.as_str());
+        println!(
+            "[WiFi Config] Received WiFi credentials via BLE: SSID='{}'",
+            ssid.as_str()
+        );
 
         match write_wifi_credentials(flash_storage, ssid.as_str(), password.as_str()) {
             Ok(()) => {
-                println!("[WiFi Config] Credentials saved successfully: SSID='{}'", ssid.as_str());
+                println!(
+                    "[WiFi Config] Credentials saved successfully: SSID='{}'",
+                    ssid.as_str()
+                );
                 update_ssid(&display_sender, ssid.as_str());
                 set_line1_override(&display_sender, "WiFi Saved!");
                 WIFI_RECONNECT.signal((ssid, password));
             }
             Err(e) => {
-                println!("[WiFi Config] Failed to save credentials for SSID='{}': {}", ssid.as_str(), e);
+                println!(
+                    "[WiFi Config] Failed to save credentials for SSID='{}': {}",
+                    ssid.as_str(),
+                    e
+                );
                 set_line1_override(&display_sender, "Save Failed!");
             }
         }
@@ -145,13 +163,34 @@ pub async fn wifi_connection_task(
         heapless::String::try_from(SSID).unwrap_or_default();
     let mut current_password: heapless::String<MAX_PASSWORD_LEN> =
         heapless::String::try_from(PASSWORD).unwrap_or_default();
+
+    match select(WIFI_RECONNECT.wait(), Timer::after(Duration::from_millis(500))).await {
+        Either::First((ssid, password)) => {
+            println!(
+                "[WiFi] Using stored credentials from boot: SSID='{}'",
+                ssid.as_str()
+            );
+            current_ssid = ssid;
+            current_password = password;
+        }
+        Either::Second(_) => {
+            println!(
+                "[WiFi] No stored credentials, using defaults: SSID='{}'",
+                current_ssid.as_str()
+            );
+        }
+    }
+
     let mut needs_reconfigure = true;
 
     loop {
         // Check if new credentials are available (non-blocking check)
         if WIFI_RECONNECT.signaled() {
             let (new_ssid, new_password) = WIFI_RECONNECT.wait().await;
-            println!("[WiFi] New credentials received: SSID='{}'", new_ssid.as_str());
+            println!(
+                "[WiFi] New credentials received: SSID='{}'",
+                new_ssid.as_str()
+            );
 
             if new_ssid.as_str() != current_ssid.as_str()
                 || new_password.as_str() != current_password.as_str()
@@ -227,9 +266,9 @@ pub async fn wifi_connection_task(
 
         println!("Connecting to WiFi network: {}", current_ssid.as_str());
 
-        let mut connect_future = pin!(controller.connect_async());
         let mut period_count: u8 = 0;
         let mut new_creds_arrived = false;
+        let mut connect_future = pin!(controller.connect_async());
 
         let result = loop {
             match select(
@@ -246,6 +285,7 @@ pub async fn wifi_connection_task(
                         new_creds_arrived = true;
                         break None;
                     }
+
                     period_count = (period_count + 1) % 4;
                     update_dots(&display_sender, period_count);
                     match period_count {

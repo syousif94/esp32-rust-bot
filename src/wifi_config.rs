@@ -3,9 +3,9 @@
 //! Stores WiFi SSID and password in a dedicated flash region so credentials
 //! can be configured via BLE and persist across reboots.
 
-use esp_storage::FlashStorage;
-use embedded_storage::nor_flash::{ReadNorFlash, NorFlash};
+use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
 use esp_println::println;
+use esp_storage::FlashStorage;
 
 /// Magic bytes to identify valid stored credentials
 const MAGIC: [u8; 4] = [0xCA, 0xFE, 0xBE, 0xEF];
@@ -46,28 +46,28 @@ impl WifiCredentials {
 /// Read WiFi credentials from flash storage
 pub fn read_wifi_credentials(flash: &mut FlashStorage<'_>) -> Option<WifiCredentials> {
     let mut buffer = [0u8; 128]; // Only read what we need
-    
+
     if let Err(e) = flash.read(FLASH_OFFSET, &mut buffer) {
         println!("[WiFi Config] Flash read error: {:?}", e);
         return None;
     }
-    
+
     // Check magic bytes
     if buffer[0..4] != MAGIC {
         println!("[WiFi Config] No valid credentials found (magic mismatch)");
         return None;
     }
-    
+
     // Read SSID
     let ssid_len = buffer[4] as usize;
     if ssid_len == 0 || ssid_len > MAX_SSID_LEN {
         println!("[WiFi Config] Invalid SSID length: {}", ssid_len);
         return None;
     }
-    
+
     let ssid_bytes = &buffer[5..5 + ssid_len];
     let ssid = core::str::from_utf8(ssid_bytes).ok()?;
-    
+
     // Read password
     let pass_offset = 5 + MAX_SSID_LEN;
     let pass_len = buffer[pass_offset] as usize;
@@ -75,49 +75,53 @@ pub fn read_wifi_credentials(flash: &mut FlashStorage<'_>) -> Option<WifiCredent
         println!("[WiFi Config] Invalid password length: {}", pass_len);
         return None;
     }
-    
+
     let pass_bytes = &buffer[pass_offset + 1..pass_offset + 1 + pass_len];
     let password = core::str::from_utf8(pass_bytes).ok()?;
-    
+
     println!("[WiFi Config] Loaded credentials for SSID: {}", ssid);
     WifiCredentials::new(ssid, password)
 }
 
 /// Write WiFi credentials to flash storage
-pub fn write_wifi_credentials(flash: &mut FlashStorage<'_>, ssid: &str, password: &str) -> Result<(), &'static str> {
+pub fn write_wifi_credentials(
+    flash: &mut FlashStorage<'_>,
+    ssid: &str,
+    password: &str,
+) -> Result<(), &'static str> {
     if ssid.is_empty() || ssid.len() > MAX_SSID_LEN {
         return Err("SSID must be 1-32 bytes");
     }
     if password.len() > MAX_PASSWORD_LEN {
         return Err("Password must be 0-64 bytes");
     }
-    
+
     let mut buffer = [0xFFu8; STORAGE_SIZE]; // 0xFF is erased flash state
-    
+
     // Write magic
     buffer[0..4].copy_from_slice(&MAGIC);
-    
+
     // Write SSID
     buffer[4] = ssid.len() as u8;
     buffer[5..5 + ssid.len()].copy_from_slice(ssid.as_bytes());
-    
+
     // Write password
     let pass_offset = 5 + MAX_SSID_LEN;
     buffer[pass_offset] = password.len() as u8;
     buffer[pass_offset + 1..pass_offset + 1 + password.len()].copy_from_slice(password.as_bytes());
-    
+
     // Erase the sector first (ESP32 requires 4KB sector erase)
     if let Err(e) = flash.erase(FLASH_OFFSET, FLASH_OFFSET + STORAGE_SIZE as u32) {
         println!("[WiFi Config] Flash erase error: {:?}", e);
         return Err("Flash erase failed");
     }
-    
+
     // Write the data
     if let Err(e) = flash.write(FLASH_OFFSET, &buffer) {
         println!("[WiFi Config] Flash write error: {:?}", e);
         return Err("Flash write failed");
     }
-    
+
     println!("[WiFi Config] Saved credentials for SSID: {}", ssid);
     Ok(())
 }
@@ -129,7 +133,7 @@ pub fn clear_wifi_credentials(flash: &mut FlashStorage<'_>) -> Result<(), &'stat
         println!("[WiFi Config] Flash erase error: {:?}", e);
         return Err("Flash erase failed");
     }
-    
+
     println!("[WiFi Config] Credentials cleared");
     Ok(())
 }

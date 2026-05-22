@@ -1,11 +1,11 @@
-use esp_hal::ledc::{
-    channel::{self, ChannelIFace, ChannelHW},
-    timer::{self, TimerIFace, config::Duty},
-    Ledc, HighSpeed,
-};
-use esp_hal::gpio::{DriveMode, interconnect::PeripheralOutput};
 #[cfg(feature = "two_motor")]
 use esp_hal::gpio::Output;
+use esp_hal::gpio::{DriveMode, interconnect::PeripheralOutput};
+use esp_hal::ledc::{
+    HighSpeed, Ledc,
+    channel::{self, ChannelHW, ChannelIFace},
+    timer::{self, TimerIFace, config::Duty},
+};
 use esp_println::println;
 
 /// PWM frequency for brushless motor control via H-bridge
@@ -28,7 +28,7 @@ pub struct BrushlessMotor<'d> {
 
 impl<'d> BrushlessMotor<'d> {
     /// Create a new H-bridge motor controller
-    /// 
+    ///
     /// # Arguments
     /// * `timer` - LEDC timer configured for motor PWM frequency
     /// * `pin_a` - GPIO pin for forward direction (e.g., GPIO32)
@@ -46,34 +46,42 @@ impl<'d> BrushlessMotor<'d> {
     ) -> Self {
         println!("Initializing {} (H-Bridge LEDC)", name);
         println!("  PWM frequency: {} Hz", MOTOR_FREQ_HZ);
-        
+
         let mut channel_a = channel::Channel::new(channel_num_a, pin_a);
-        channel_a.configure(channel::config::Config {
-            timer,
-            duty_pct: 0,
-            drive_mode: DriveMode::PushPull,
-        }).unwrap();
+        channel_a
+            .configure(channel::config::Config {
+                timer,
+                duty_pct: 0,
+                drive_mode: DriveMode::PushPull,
+            })
+            .unwrap();
         channel_a.set_duty_hw(0);
-        
+
         let mut channel_b = channel::Channel::new(channel_num_b, pin_b);
-        channel_b.configure(channel::config::Config {
-            timer,
-            duty_pct: 0,
-            drive_mode: DriveMode::PushPull,
-        }).unwrap();
+        channel_b
+            .configure(channel::config::Config {
+                timer,
+                duty_pct: 0,
+                drive_mode: DriveMode::PushPull,
+            })
+            .unwrap();
         channel_b.set_duty_hw(0);
-        
-        Self { channel_a, channel_b, name }
+
+        Self {
+            channel_a,
+            channel_b,
+            name,
+        }
     }
 
     /// Set motor power and direction
-    /// 
+    ///
     /// # Arguments
     /// * `power` - Power level from -100 (full reverse) to +100 (full forward)
     ///            0 = brake/stop
     pub fn set_power(&mut self, power: i8) {
         let power = power.clamp(-100, 100);
-        
+
         if power > 0 {
             // Forward: channel_a = duty, channel_b = 0
             let duty_raw = (power as u32 * DUTY_RESOLUTION) / 100;
@@ -106,11 +114,13 @@ impl<'d> BrushlessMotor<'d> {
 /// Uses Timer1 (separate from servo Timer0) for 1kHz PWM frequency
 pub fn init_motor_timer<'d>(ledc: &'d Ledc<'d>) -> timer::Timer<'d, HighSpeed> {
     let mut timer = ledc.timer::<HighSpeed>(timer::Number::Timer1);
-    timer.configure(timer::config::Config {
-        duty: Duty::Duty14Bit,
-        clock_source: timer::HSClockSource::APBClk,
-        frequency: esp_hal::time::Rate::from_hz(MOTOR_FREQ_HZ),
-    }).unwrap();
+    timer
+        .configure(timer::config::Config {
+            duty: Duty::Duty14Bit,
+            clock_source: timer::HSClockSource::APBClk,
+            frequency: esp_hal::time::Rate::from_hz(MOTOR_FREQ_HZ),
+        })
+        .unwrap();
     timer
 }
 
@@ -168,14 +178,21 @@ impl<'d> TB6612Motor<'d> {
         println!("  PWM frequency: {} Hz", MOTOR_FREQ_HZ);
 
         let mut pwm_channel = channel::Channel::new(channel_num, pwm_pin);
-        pwm_channel.configure(channel::config::Config {
-            timer,
-            duty_pct: 0,
-            drive_mode: DriveMode::PushPull,
-        }).unwrap();
+        pwm_channel
+            .configure(channel::config::Config {
+                timer,
+                duty_pct: 0,
+                drive_mode: DriveMode::PushPull,
+            })
+            .unwrap();
         pwm_channel.set_duty_hw(0);
 
-        Self { in1, in2, pwm_channel, name }
+        Self {
+            in1,
+            in2,
+            pwm_channel,
+            name,
+        }
     }
 
     /// Set motor power and direction

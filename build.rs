@@ -1,7 +1,7 @@
 fn main() {
     // Rerun if cfg.toml changes
     println!("cargo:rerun-if-changed=cfg.toml");
-    
+
     // Load WiFi configuration from cfg.toml if it exists
     if let Ok(content) = std::fs::read_to_string("cfg.toml") {
         for line in content.lines() {

@@ -1,8 +1,8 @@
-use embassy_net::tcp::TcpSocket;
+use crate::commands::{BATTERY_MV, BATTERY_PCT, Command, MOTOR_COUNT, MotorId, send_command};
 use embassy_net::Stack;
+use embassy_net::tcp::TcpSocket;
 use embassy_time::Duration;
 use esp_println::println;
-use crate::commands::{Command, MotorId, send_command, MOTOR_COUNT, BATTERY_MV, BATTERY_PCT};
 
 /// Buffer sizes for HTTP server
 const RX_BUFFER_SIZE: usize = 1024;
@@ -37,7 +37,7 @@ fn parse_servo_angle(path: &str) -> Option<u8> {
     if let Some(angle_str) = path.strip_prefix("/servo/") {
         return angle_str.parse().ok();
     }
-    
+
     // Try query format: /servo?angle=90
     if path.starts_with("/servo?") || path.starts_with("/servo?") {
         for part in path.split('?').nth(1)?.split('&') {
@@ -46,7 +46,7 @@ fn parse_servo_angle(path: &str) -> Option<u8> {
             }
         }
     }
-    
+
     None
 }
 
@@ -65,7 +65,7 @@ fn parse_motor_power(path: &str) -> Option<(char, i8)> {
             return Some((motor_id, power));
         }
     }
-    
+
     // Try query format: /motor/a?power=50
     if path.starts_with("/motor/") {
         let rest = path.strip_prefix("/motor/")?;
@@ -82,7 +82,7 @@ fn parse_motor_power(path: &str) -> Option<(char, i8)> {
             }
         }
     }
-    
+
     None
 }
 
@@ -105,22 +105,34 @@ fn parse_motors_batch(path: &str) -> Option<[Option<i8>; MOTOR_COUNT]> {
     for part in query.split('&') {
         if let Some(val) = part.strip_prefix("a=") {
             if let Ok(p) = val.parse::<i8>() {
-                if p >= -100 && p <= 100 { result[0] = Some(p); found_any = true; }
+                if p >= -100 && p <= 100 {
+                    result[0] = Some(p);
+                    found_any = true;
+                }
             }
         } else if let Some(val) = part.strip_prefix("b=") {
             if let Ok(p) = val.parse::<i8>() {
-                if p >= -100 && p <= 100 { result[1] = Some(p); found_any = true; }
+                if p >= -100 && p <= 100 {
+                    result[1] = Some(p);
+                    found_any = true;
+                }
             }
         }
         #[cfg(feature = "four_motor")]
         {
             if let Some(val) = part.strip_prefix("c=") {
                 if let Ok(p) = val.parse::<i8>() {
-                    if p >= -100 && p <= 100 { result[2] = Some(p); found_any = true; }
+                    if p >= -100 && p <= 100 {
+                        result[2] = Some(p);
+                        found_any = true;
+                    }
                 }
             } else if let Some(val) = part.strip_prefix("d=") {
                 if let Ok(p) = val.parse::<i8>() {
-                    if p >= -100 && p <= 100 { result[3] = Some(p); found_any = true; }
+                    if p >= -100 && p <= 100 {
+                        result[3] = Some(p);
+                        found_any = true;
+                    }
                 }
             }
         }
@@ -147,7 +159,11 @@ fn build_html_headers() -> alloc::string::String {
 /// Handle an incoming HTTP request and return a response
 fn handle_request(request: &str) -> HttpResponse {
     let Some((method, path)) = parse_request(request) else {
-        return HttpResponse::Small(build_response("400 Bad Request", "text/plain", "Bad Request"));
+        return HttpResponse::Small(build_response(
+            "400 Bad Request",
+            "text/plain",
+            "Bad Request",
+        ));
     };
 
     println!("HTTP {} {}", method, path);
@@ -168,12 +184,16 @@ fn handle_request(request: &str) -> HttpResponse {
                 let frac = (mv % 1000) / 10;
                 let body = alloc::format!(
                     r#"{{"voltage":"{}.{:02}","voltage_mv":{},"percentage":{}}}"#,
-                    volts, frac, mv, pct
+                    volts,
+                    frac,
+                    mv,
+                    pct
                 );
                 HttpResponse::Small(build_response("200 OK", "application/json", &body))
             } else if path == "/config" {
                 #[cfg(feature = "four_motor")]
-                let body = r#"{"motor_mode":"four_motor","motor_count":4,"motors":["a","b","c","d"]}"#;
+                let body =
+                    r#"{"motor_mode":"four_motor","motor_count":4,"motors":["a","b","c","d"]}"#;
                 #[cfg(feature = "two_motor")]
                 let body = r#"{"motor_mode":"two_motor","motor_count":2,"motors":["a","b"]}"#;
                 HttpResponse::Small(build_response("200 OK", "application/json", body))
@@ -200,7 +220,8 @@ fn handle_request(request: &str) -> HttpResponse {
                     );
                     HttpResponse::Small(build_response("200 OK", "application/json", &body))
                 } else {
-                    let body = r#"{"error": "Provide at least one motor param: /motors?a=50&b=-30"}"#;
+                    let body =
+                        r#"{"error": "Provide at least one motor param: /motors?a=50&b=-30"}"#;
                     HttpResponse::Small(build_response("400 Bad Request", "application/json", body))
                 }
             } else if path.starts_with("/motor/") {
@@ -216,11 +237,16 @@ fn handle_request(request: &str) -> HttpResponse {
                             _ => unreachable!(),
                         };
                         send_command(Command::Motor(id, power));
-                        let body = alloc::format!(r#"{{"motor": "{}", "power": {}}}"#, motor_id, power);
+                        let body =
+                            alloc::format!(r#"{{"motor": "{}", "power": {}}}"#, motor_id, power);
                         HttpResponse::Small(build_response("200 OK", "application/json", &body))
                     } else {
                         let body = r#"{"error": "Power must be between -100 and 100"}"#;
-                        HttpResponse::Small(build_response("400 Bad Request", "application/json", body))
+                        HttpResponse::Small(build_response(
+                            "400 Bad Request",
+                            "application/json",
+                            body,
+                        ))
                     }
                 } else {
                     let body = r#"{"error": "Missing or invalid power parameter. Use /motor/a/50 or /motor/a?power=50"}"#;
@@ -229,12 +255,23 @@ fn handle_request(request: &str) -> HttpResponse {
             } else if path.starts_with("/servo") {
                 if let Some(angle) = parse_servo_angle(path) {
                     if angle <= 180 {
-                        send_command(Command::Servo(angle));
-                        let body = alloc::format!(r#"{{"angle": {}}}"#, angle);
+                        let pos = (angle as u16 * 4095) / 180;
+                        send_command(Command::St3215Move {
+                            id: 1,
+                            pos,
+                            speed: 1000,
+                            acc: 50,
+                        });
+                        let body =
+                            alloc::format!(r#"{{"angle": {}, "id": 1, "pos": {}}}"#, angle, pos);
                         HttpResponse::Small(build_response("200 OK", "application/json", &body))
                     } else {
                         let body = r#"{"error": "Angle must be between 0 and 180"}"#;
-                        HttpResponse::Small(build_response("400 Bad Request", "application/json", body))
+                        HttpResponse::Small(build_response(
+                            "400 Bad Request",
+                            "application/json",
+                            body,
+                        ))
                     }
                 } else {
                     let body = r#"{"error": "Missing or invalid angle parameter. Use /servo/90 or /servo?angle=90"}"#;
@@ -247,7 +284,11 @@ fn handle_request(request: &str) -> HttpResponse {
         }
         _ => {
             let body = r#"{"error": "Method Not Allowed"}"#;
-            HttpResponse::Small(build_response("405 Method Not Allowed", "application/json", body))
+            HttpResponse::Small(build_response(
+                "405 Method Not Allowed",
+                "application/json",
+                body,
+            ))
         }
     }
 }
