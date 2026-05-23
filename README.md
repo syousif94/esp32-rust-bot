@@ -67,8 +67,16 @@ wifi_password = "YourPassword"
 
 ## Building and Flashing
 
+Default firmware is BLE-first and does not start WiFi:
+
 ```bash
 cargo espflash flash --monitor
+```
+
+Build the WiFi/webserver firmware explicitly when you want HTTP control:
+
+```bash
+cargo espflash flash --features wifi --monitor
 ```
 
 ## Usage

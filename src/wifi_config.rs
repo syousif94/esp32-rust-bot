@@ -3,6 +3,8 @@
 //! Stores WiFi SSID and password in a dedicated flash region so credentials
 //! can be configured via BLE and persist across reboots.
 
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
 use esp_println::println;
 use esp_storage::FlashStorage;
@@ -24,6 +26,35 @@ pub const MAX_PASSWORD_LEN: usize = 64;
 /// Total storage size: 4 (magic) + 1 (ssid_len) + 32 (ssid) + 1 (pass_len) + 64 (pass) = 102 bytes
 /// Round up to 4096 (one flash sector) for alignment - flash must be erased in sectors
 const STORAGE_SIZE: usize = 4096;
+const PASS_LEN_OFFSET: usize = 5 + MAX_SSID_LEN;
+const MODE_MAGIC: [u8; 4] = [0x52, 0x41, 0x44, 0x49];
+const MODE_MAGIC_OFFSET: usize = 128;
+const MODE_VALUE_OFFSET: usize = MODE_MAGIC_OFFSET + 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RadioMode {
+    Ble,
+    Wifi,
+}
+
+impl RadioMode {
+    fn as_byte(self) -> u8 {
+        match self {
+            RadioMode::Ble => b'b',
+            RadioMode::Wifi => b'w',
+        }
+    }
+
+    fn from_byte(value: u8) -> Option<Self> {
+        match value {
+            b'b' => Some(RadioMode::Ble),
+            b'w' => Some(RadioMode::Wifi),
+            _ => None,
+        }
+    }
+}
+
+pub static RADIO_MODE_REQUEST: Signal<CriticalSectionRawMutex, RadioMode> = Signal::new();
 
 /// WiFi credentials structure
 #[derive(Debug, Clone)]
@@ -69,14 +100,13 @@ pub fn read_wifi_credentials(flash: &mut FlashStorage<'_>) -> Option<WifiCredent
     let ssid = core::str::from_utf8(ssid_bytes).ok()?;
 
     // Read password
-    let pass_offset = 5 + MAX_SSID_LEN;
-    let pass_len = buffer[pass_offset] as usize;
+    let pass_len = buffer[PASS_LEN_OFFSET] as usize;
     if pass_len > MAX_PASSWORD_LEN {
         println!("[WiFi Config] Invalid password length: {}", pass_len);
         return None;
     }
 
-    let pass_bytes = &buffer[pass_offset + 1..pass_offset + 1 + pass_len];
+    let pass_bytes = &buffer[PASS_LEN_OFFSET + 1..PASS_LEN_OFFSET + 1 + pass_len];
     let password = core::str::from_utf8(pass_bytes).ok()?;
 
     println!("[WiFi Config] Loaded credentials for SSID: {}", ssid);
@@ -98,6 +128,14 @@ pub fn write_wifi_credentials(
 
     let mut buffer = [0xFFu8; STORAGE_SIZE]; // 0xFF is erased flash state
 
+    match flash.read(FLASH_OFFSET, &mut buffer) {
+        Ok(()) => {}
+        Err(e) => println!(
+            "[WiFi Config] Flash read before credential write failed: {:?}",
+            e
+        ),
+    }
+
     // Write magic
     buffer[0..4].copy_from_slice(&MAGIC);
 
@@ -106,9 +144,9 @@ pub fn write_wifi_credentials(
     buffer[5..5 + ssid.len()].copy_from_slice(ssid.as_bytes());
 
     // Write password
-    let pass_offset = 5 + MAX_SSID_LEN;
-    buffer[pass_offset] = password.len() as u8;
-    buffer[pass_offset + 1..pass_offset + 1 + password.len()].copy_from_slice(password.as_bytes());
+    buffer[PASS_LEN_OFFSET] = password.len() as u8;
+    buffer[PASS_LEN_OFFSET + 1..PASS_LEN_OFFSET + 1 + password.len()]
+        .copy_from_slice(password.as_bytes());
 
     // Erase the sector first (ESP32 requires 4KB sector erase)
     if let Err(e) = flash.erase(FLASH_OFFSET, FLASH_OFFSET + STORAGE_SIZE as u32) {
@@ -123,6 +161,52 @@ pub fn write_wifi_credentials(
     }
 
     println!("[WiFi Config] Saved credentials for SSID: {}", ssid);
+    Ok(())
+}
+
+pub fn read_radio_mode(flash: &mut FlashStorage<'_>) -> RadioMode {
+    let mut buffer = [0u8; 136];
+
+    if let Err(e) = flash.read(FLASH_OFFSET, &mut buffer) {
+        println!("[Radio Config] Flash read error: {:?}", e);
+        return RadioMode::Ble;
+    }
+
+    if buffer[MODE_MAGIC_OFFSET..MODE_MAGIC_OFFSET + 4] != MODE_MAGIC {
+        println!("[Radio Config] No stored mode; defaulting to BLE");
+        return RadioMode::Ble;
+    }
+
+    let mode = RadioMode::from_byte(buffer[MODE_VALUE_OFFSET]).unwrap_or(RadioMode::Ble);
+    println!("[Radio Config] Boot mode: {:?}", mode);
+    mode
+}
+
+pub fn write_radio_mode(flash: &mut FlashStorage<'_>, mode: RadioMode) -> Result<(), &'static str> {
+    let mut buffer = [0xFFu8; STORAGE_SIZE];
+
+    match flash.read(FLASH_OFFSET, &mut buffer) {
+        Ok(()) => {}
+        Err(e) => println!(
+            "[Radio Config] Flash read before mode write failed: {:?}",
+            e
+        ),
+    }
+
+    buffer[MODE_MAGIC_OFFSET..MODE_MAGIC_OFFSET + 4].copy_from_slice(&MODE_MAGIC);
+    buffer[MODE_VALUE_OFFSET] = mode.as_byte();
+
+    if let Err(e) = flash.erase(FLASH_OFFSET, FLASH_OFFSET + STORAGE_SIZE as u32) {
+        println!("[Radio Config] Flash erase error: {:?}", e);
+        return Err("Flash erase failed");
+    }
+
+    if let Err(e) = flash.write(FLASH_OFFSET, &buffer) {
+        println!("[Radio Config] Flash write error: {:?}", e);
+        return Err("Flash write failed");
+    }
+
+    println!("[Radio Config] Saved boot mode: {:?}", mode);
     Ok(())
 }
 

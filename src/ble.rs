@@ -4,12 +4,21 @@
 //! connect to. Provides characteristics for motor power levels, ST3215
 //! commands, servo discovery, and WiFi configuration.
 
-use crate::commands::{BATTERY_MV, BATTERY_PCT, Command, MOTOR_COUNT, send_command};
+use alloc::{
+    alloc::{Layout, dealloc},
+    boxed::Box,
+};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::commands::{
+    BATTERY_MV, BATTERY_PCT, Command, MOTOR_COUNT, request_battery_sample, send_command,
+};
 use crate::st3215::{MAX_SERVOS, SHARED_BUS, SHARED_LIST};
 use crate::wifi_config::{MAX_PASSWORD_LEN, MAX_SSID_LEN};
-use embassy_futures::join::join;
+use embassy_futures::select::select;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Timer};
 use esp_println::println;
 use esp_radio::ble::controller::BleConnector;
 use static_cell::StaticCell;
@@ -31,12 +40,38 @@ pub type WifiCredentialsData = (
 pub static BLE_WIFI_CREDENTIALS: Signal<CriticalSectionRawMutex, WifiCredentialsData> =
     Signal::new();
 
+static BLE_RUNNING: AtomicBool = AtomicBool::new(false);
+static BLE_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+static BLE_STOP_REQUEST: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static BLE_STOPPED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+pub fn ble_running() -> bool {
+    BLE_RUNNING.load(Ordering::Relaxed)
+}
+
+pub fn request_ble_stop() {
+    if BLE_RUNNING.load(Ordering::Relaxed) && !BLE_STOP_REQUESTED.swap(true, Ordering::Relaxed) {
+        println!("[BLE] stop requested");
+        BLE_STOP_REQUEST.signal(());
+    }
+}
+
+pub async fn wait_ble_stopped() {
+    if ble_running() || BLE_STOP_REQUESTED.load(Ordering::Relaxed) {
+        BLE_STOPPED.wait().await;
+    }
+}
+
+fn ble_deinit_for_switch() {
+    println!("[BLE] host stopped; leaving BTDM controller idle for WiFi switch");
+}
+
 // Custom 128-bit UUIDs.
 //
 // Service UUID bumped after GATT layout changes so iOS / CoreBluetooth
 // invalidates its cached GATT table and re-discovers the new layout.
 //
-// Service:     e3910030-4567-4321-abcd-abcdef012345
+// Service:     e3910040-4567-4321-abcd-abcdef012345
 // Motors:      e3910003-4567-4321-abcd-abcdef012345
 // WiFi Config: e3910004-4567-4321-abcd-abcdef012345
 // Battery:     e3910006-4567-4321-abcd-abcdef012345
@@ -56,7 +91,7 @@ struct Server {
 /// attributes to the `AttributeTable` that `Server::new_with_config` builds
 /// on the stack, and the ESP32 main-task stack is tight when the WiFi heap
 /// is also active.
-#[gatt_service(uuid = "e3910030-4567-4321-abcd-abcdef012345")]
+#[gatt_service(uuid = "e3910040-4567-4321-abcd-abcdef012345")]
 struct MotorControlService {
     /// All motors (4 bytes; only the first MOTOR_COUNT are used).
     #[characteristic(uuid = "e3910003-4567-4321-abcd-abcdef012345", read, write, write_without_response, notify, value = [0, 0, 0, 0])]
@@ -83,6 +118,7 @@ struct MotorControlService {
     ///   [0x04, id, 0, 0, 0, 0]                          -> PING
     ///   [0x05, id, 0, 0, 0, 0]                          -> READ (refreshes st_state)
     ///   [0x06, from, to, 0, 0, 0]                       -> RESCAN
+    ///   [0x07, pos_lo, pos_hi, speed_lo, speed_hi, acc] -> MOVE_DISCOVERED
     #[characteristic(uuid = "e3910012-4567-4321-abcd-abcdef012345", write, write_without_response, value = [0u8; 6])]
     st_cmd: [u8; 6],
 
@@ -105,6 +141,54 @@ async fn snapshot_list() -> [u8; 16] {
         }
     }
     out
+}
+
+/// Re-scan the ST3215 bus and return the fresh shared list snapshot.
+async fn rescan_list(from: u8, to: u8) -> [u8; 16] {
+    let Some(bus) = SHARED_BUS.try_get() else {
+        return snapshot_list().await;
+    };
+    let Some(list) = SHARED_LIST.try_get() else {
+        return snapshot_list().await;
+    };
+
+    let mut bus_guard = bus.lock().await;
+    let mut list_guard = list.lock().await;
+    bus_guard.scan(from, to, &mut list_guard).await;
+
+    let mut out = [0u8; 16];
+    for (i, id) in list_guard.iter().take(MAX_SERVOS).enumerate() {
+        out[i] = *id;
+    }
+    out
+}
+
+/// Build a sync-write move for every currently discovered ST3215 servo.
+async fn move_discovered(pos: u16, speed: u16, acc: u8) {
+    let Some(list) = SHARED_LIST.try_get() else {
+        return;
+    };
+
+    let list_guard = list.lock().await;
+    let mut moves = [(0u8, 0u16); MAX_SERVOS];
+    let mut count = 0u8;
+    for id in list_guard.iter().take(MAX_SERVOS) {
+        moves[count as usize] = (*id, pos);
+        count += 1;
+    }
+    drop(list_guard);
+
+    if count == 0 {
+        println!("[BLE] st_cmd: no discovered servos to move");
+        return;
+    }
+
+    send_command(Command::St3215MoveAll {
+        count,
+        moves,
+        speed,
+        acc,
+    });
 }
 
 /// Run the BLE host stack background task
@@ -151,6 +235,16 @@ async fn gatt_events_task<P: PacketPool>(
     let reason = loop {
         match conn.next().await {
             GattConnectionEvent::Disconnected { reason } => break reason,
+            GattConnectionEvent::ConnectionParamsUpdated {
+                conn_interval,
+                peripheral_latency,
+                supervision_timeout,
+            } => {
+                println!(
+                    "[BLE] connection params updated: interval={:?} latency={} timeout={:?}",
+                    conn_interval, peripheral_latency, supervision_timeout
+                );
+            }
             GattConnectionEvent::Gatt { event } => {
                 match &event {
                     GattEvent::Write(write_event) => {
@@ -195,6 +289,7 @@ async fn gatt_events_task<P: PacketPool>(
                     GattEvent::Read(read_event) => {
                         let handle = read_event.handle();
                         if handle == server.motor_control.battery.handle {
+                            request_battery_sample(Duration::from_millis(100)).await;
                             let mv = BATTERY_MV.load(core::sync::atomic::Ordering::Relaxed);
                             let pct = BATTERY_PCT.load(core::sync::atomic::Ordering::Relaxed);
                             let _ = server
@@ -279,10 +374,13 @@ async fn handle_st_cmd<P: PacketPool>(
         0x06 => {
             let from = if data[1] == 0 { 1 } else { data[1] };
             let to = if data[2] == 0 { 20 } else { data[2] };
-            send_command(Command::St3215Rescan { from, to });
-            // Push a fresh snapshot a moment later — best-effort.
-            let snap = snapshot_list().await;
+            let snap = rescan_list(from, to).await;
             let _ = server.motor_control.st_list.set(server, &snap);
+        }
+        0x07 => {
+            let pos = u16::from_le_bytes([data[1], data[2]]);
+            let speed = u16::from_le_bytes([data[3], data[4]]);
+            move_discovered(pos, speed, data[5]).await;
         }
         _ => println!("[BLE] st_cmd: unknown op 0x{:02X}", op),
     }
@@ -293,10 +391,10 @@ async fn advertise<'values, 'server, C: Controller>(
     name: &'values str,
     peripheral: &mut Peripheral<'values, C, DefaultPacketPool>,
     server: &'server Server<'values>,
-) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>> {
-    // UUID e3910030-4567-4321-abcd-abcdef012345 in little-endian byte order
+) -> Result<Option<GattConnection<'values, 'server, DefaultPacketPool>>, BleHostError<C::Error>> {
+    // UUID e3910040-4567-4321-abcd-abcdef012345 in little-endian byte order
     const SERVICE_UUID: [u8; 16] = [
-        0x45, 0x23, 0x01, 0xef, 0xcd, 0xab, 0xcd, 0xab, 0x21, 0x43, 0x67, 0x45, 0x30, 0x00, 0x91,
+        0x45, 0x23, 0x01, 0xef, 0xcd, 0xab, 0xcd, 0xab, 0x21, 0x43, 0x67, 0x45, 0x40, 0x00, 0x91,
         0xe3,
     ];
     let mut advertiser_data = [0; 31];
@@ -314,75 +412,124 @@ async fn advertise<'values, 'server, C: Controller>(
     )?;
     let advertiser = peripheral
         .advertise(
-            &Default::default(),
+            &AdvertisementParameters {
+                timeout: Some(Duration::from_millis(500)),
+                ..Default::default()
+            },
             Advertisement::ConnectableScannableUndirected {
                 adv_data: &advertiser_data[..len],
                 scan_data: &scan_response[..scan_len],
             },
         )
         .await?;
-    println!("[BLE] advertising as '{}'...", name);
-    let conn = advertiser.accept().await?.with_attribute_server(server)?;
+    println!(
+        "[BLE] advertising as '{}' ([Heap] {} bytes free)...",
+        name,
+        esp_alloc::HEAP.free()
+    );
+    let conn = match advertiser.accept().await {
+        Ok(conn) => conn.with_attribute_server(server)?,
+        Err(Error::Timeout) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
     println!("[BLE] connection established");
+    println!(
+        "[BLE] after connection ([Heap] {} bytes free)",
+        esp_alloc::HEAP.free()
+    );
     let sender = crate::display::DISPLAY_STATE.sender();
     crate::display::set_line1_override(&sender, "BLE: Connected");
-    Ok(conn)
+    Ok(Some(conn))
 }
 
 /// Main BLE task — runs advertising + GATT server forever
 #[embassy_executor::task]
 pub async fn ble_task(connector: BleConnector<'static>) {
-    let controller: ExternalController<_, 20> = ExternalController::new(connector);
+    BLE_STOP_REQUEST.reset();
+    BLE_STOPPED.reset();
+    BLE_STOP_REQUESTED.store(false, Ordering::Relaxed);
+    BLE_RUNNING.store(true, Ordering::Relaxed);
 
-    let address = Address::random([0xff, 0x8f, 0x1a, 0x05, 0xe4, 0xfe]);
-    println!("[BLE] address = {:?}", address);
+    {
+        let controller: ExternalController<_, 20> = ExternalController::new(connector);
 
-    static RESOURCES: StaticCell<
-        HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX>,
-    > = StaticCell::new();
-    let resources = RESOURCES.init(HostResources::new());
+        let address = Address::random([0xff, 0x8f, 0x1a, 0x05, 0xe4, 0xfe]);
+        println!("[BLE] address = {:?}", address);
+        println!(
+            "[BLE] task start ([Heap] {} bytes free)",
+            esp_alloc::HEAP.free()
+        );
 
-    type MyStack = trouble_host::Stack<
-        'static,
-        ExternalController<BleConnector<'static>, 20>,
-        DefaultPacketPool,
-    >;
-    static STACK: StaticCell<MyStack> = StaticCell::new();
-    let stack: &'static mut MyStack =
-        STACK.init(trouble_host::new(controller, resources).set_random_address(address));
-    let Host {
-        mut peripheral,
-        runner,
-        ..
-    } = stack.build();
+        static RESOURCES: StaticCell<
+            HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX>,
+        > = StaticCell::new();
+        let resources = RESOURCES.init(HostResources::new());
 
-    // Use `init_with` so the (large) Server is constructed in-place inside
-    // the StaticCell rather than on the main-task stack — with our
-    // 7-characteristic service the attribute table alone is >1 KB and an
-    // intermediate stack copy trips the stack guard.
-    static SERVER: StaticCell<Server<'static>> = StaticCell::new();
-    let server = SERVER.init_with(|| {
-        Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
-            name: "ESP32 Motor",
-            appearance: &appearance::UNKNOWN,
-        }))
-        .unwrap()
-    });
+        type MyStack = trouble_host::Stack<
+            'static,
+            ExternalController<BleConnector<'static>, 20>,
+            DefaultPacketPool,
+        >;
+        let stack_ptr: *mut MyStack = Box::into_raw(Box::new(
+            trouble_host::new(controller, resources).set_random_address(address),
+        ));
+        let stack: &'static MyStack = unsafe { &*stack_ptr };
+        let Host {
+            mut peripheral,
+            runner,
+            ..
+        } = stack.build();
 
-    println!("[BLE] GATT server started (MOTOR_COUNT = {})", MOTOR_COUNT);
+        static SERVER: StaticCell<Server<'static>> = StaticCell::new();
+        let server = SERVER.init_with(|| {
+            Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
+                name: "ESP32 Motor",
+                appearance: &appearance::UNKNOWN,
+            }))
+            .unwrap()
+        });
 
-    let _ = join(ble_runner(runner), async {
-        loop {
-            match advertise("ESP32 Motor", &mut peripheral, &server).await {
-                Ok(conn) => {
-                    // Push the current list at connect time.
-                    let snap = snapshot_list().await;
-                    let _ = server.motor_control.st_list.set(server, &snap);
-                    let _ = gatt_events_task(&server, &conn).await;
+        println!("[BLE] GATT server started (MOTOR_COUNT = {})", MOTOR_COUNT);
+        println!(
+            "[BLE] after GATT server init ([Heap] {} bytes free)",
+            esp_alloc::HEAP.free()
+        );
+
+        let _ = select(ble_runner(runner), async {
+            loop {
+                if BLE_STOP_REQUESTED.load(Ordering::Relaxed) {
+                    break;
                 }
-                Err(e) => println!("[BLE] advertise error: {:?}", e),
+
+                match advertise("ESP32 Motor", &mut peripheral, server).await {
+                    Ok(Some(conn)) => {
+                        // Push the current list at connect time.
+                        let snap = snapshot_list().await;
+                        let _ = server.motor_control.st_list.set(server, &snap);
+                        let _ = gatt_events_task(server, &conn).await;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        println!("[BLE] advertise error: {:?}", e);
+                    }
+                }
             }
-        }
-    })
-    .await;
+
+            Timer::after(Duration::from_millis(250)).await;
+        })
+        .await;
+
+        println!("[BLE] releasing host stack storage...");
+        unsafe { dealloc(stack_ptr.cast(), Layout::new::<MyStack>()) };
+        println!("[BLE] host stack storage released");
+    }
+
+    ble_deinit_for_switch();
+    BLE_RUNNING.store(false, Ordering::Relaxed);
+    BLE_STOP_REQUESTED.store(false, Ordering::Relaxed);
+    BLE_STOPPED.signal(());
+    println!(
+        "[BLE] stopped ([Heap] {} bytes free)",
+        esp_alloc::HEAP.free()
+    );
 }

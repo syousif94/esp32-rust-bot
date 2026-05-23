@@ -32,14 +32,16 @@ embedded-io = "0.7.1"
 embedded-graphics = "0.8"
 ssd1306 = "0.9"
 heapless = "0.8"
-trouble-host = { version = "0.5.1", features = ["gatt"] }
+trouble-host = { version = "0.5.1", default-features = false, features = ["peripheral", "gatt", "derive", "default-packet-pool", "default-packet-pool-mtu-128", "default-packet-pool-size-4", "l2cap-rx-queue-size-1", "l2cap-tx-queue-size-1", "connection-event-queue-size-1"] }
 esp-storage = { version = "0.8.1", features = ["esp32"] }
 embedded-storage = "0.3.1"
+esp-wifi-sys = { version = "0.8.1", features = ["esp32"] }
 
 [features]
 default = ["two_motor"]
 four_motor = []
 two_motor = []
+wifi = []
 
 [profile.dev]
 # Rust debug is too slow.

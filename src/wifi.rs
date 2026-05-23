@@ -4,6 +4,7 @@
 //! credential persistence task, and the network stack runner.
 
 use core::pin::pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_net::Runner;
@@ -23,12 +24,16 @@ use crate::display::{
 };
 use crate::http_server::http_server_task;
 use crate::wifi_config::{
-    MAX_PASSWORD_LEN, MAX_SSID_LEN, read_wifi_credentials, write_wifi_credentials,
+    MAX_PASSWORD_LEN, MAX_SSID_LEN, RADIO_MODE_REQUEST, read_wifi_credentials, write_radio_mode,
+    write_wifi_credentials,
 };
 
 /// Compile-time default WiFi credentials (from cfg.toml / environment)
 const SSID: &str = env!("WIFI_SSID");
 const PASSWORD: &str = env!("WIFI_PASSWORD");
+
+static WIFI_MODE_REQUESTED: AtomicBool = AtomicBool::new(false);
+static WIFI_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Signal to trigger WiFi reconnection with new credentials.
 /// Contains (ssid, password) as heapless strings.
@@ -45,11 +50,45 @@ pub fn default_ssid() -> &'static str {
     SSID
 }
 
+pub fn wifi_mode_requested() -> bool {
+    WIFI_MODE_REQUESTED.load(Ordering::Relaxed)
+}
+
+fn wifi_started() -> bool {
+    WIFI_STARTED.load(Ordering::Relaxed)
+}
+
+pub fn request_wifi_mode() {
+    WIFI_MODE_REQUESTED.store(true, Ordering::Relaxed);
+    let coex_preference = unsafe {
+        esp_wifi_sys::include::coex_preference_set(
+            esp_wifi_sys::include::coex_prefer_t_COEX_PREFER_WIFI,
+        )
+    };
+    println!(
+        "[Radio] WiFi requested; coex preference set to WiFi: {}",
+        coex_preference
+    );
+}
+
+pub fn request_ble_mode() {
+    WIFI_MODE_REQUESTED.store(false, Ordering::Relaxed);
+    let coex_preference = unsafe {
+        esp_wifi_sys::include::coex_preference_set(
+            esp_wifi_sys::include::coex_prefer_t_COEX_PREFER_BT,
+        )
+    };
+    println!(
+        "[Radio] BLE requested; coex preference set to BT: {}",
+        coex_preference
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tasks
 // ---------------------------------------------------------------------------
 
-/// Persist WiFi credentials received via BLE to flash.
+/// Persist WiFi credentials received via BLE or serial to flash.
 ///
 /// On startup, reads any previously-stored credentials and signals the
 /// connection task to use them.
@@ -69,31 +108,45 @@ pub async fn wifi_config_task(
     }
 
     loop {
-        // Wait for WiFi credentials from BLE
-        let (ssid, password) = BLE_WIFI_CREDENTIALS.wait().await;
-        println!(
-            "[WiFi Config] Received WiFi credentials via BLE: SSID='{}'",
-            ssid.as_str()
-        );
-
-        match write_wifi_credentials(flash_storage, ssid.as_str(), password.as_str()) {
-            Ok(()) => {
+        match select(BLE_WIFI_CREDENTIALS.wait(), RADIO_MODE_REQUEST.wait()).await {
+            Either::First((ssid, password)) => {
                 println!(
-                    "[WiFi Config] Credentials saved successfully: SSID='{}'",
+                    "[WiFi Config] Received WiFi credentials: SSID='{}'",
                     ssid.as_str()
                 );
-                update_ssid(&display_sender, ssid.as_str());
-                set_line1_override(&display_sender, "WiFi Saved!");
-                WIFI_RECONNECT.signal((ssid, password));
+
+                match write_wifi_credentials(flash_storage, ssid.as_str(), password.as_str()) {
+                    Ok(()) => {
+                        println!(
+                            "[WiFi Config] Credentials saved successfully: SSID='{}'",
+                            ssid.as_str()
+                        );
+                        update_ssid(&display_sender, ssid.as_str());
+                        set_line1_override(&display_sender, "WiFi Saved!");
+                        WIFI_RECONNECT.signal((ssid, password));
+                    }
+                    Err(e) => {
+                        println!(
+                            "[WiFi Config] Failed to save credentials for SSID='{}': {}",
+                            ssid.as_str(),
+                            e
+                        );
+                        set_line1_override(&display_sender, "Save Failed!");
+                    }
+                }
             }
-            Err(e) => {
-                println!(
-                    "[WiFi Config] Failed to save credentials for SSID='{}': {}",
-                    ssid.as_str(),
-                    e
-                );
-                set_line1_override(&display_sender, "Save Failed!");
-            }
+            Either::Second(mode) => match write_radio_mode(flash_storage, mode) {
+                Ok(()) => {
+                    set_line1_override(&display_sender, "Mode Saved");
+                    println!("[Radio Config] Rebooting into {:?} mode", mode);
+                    Timer::after(Duration::from_millis(100)).await;
+                    esp_hal::system::software_reset();
+                }
+                Err(e) => {
+                    println!("[Radio Config] Failed to save mode: {}", e);
+                    set_line1_override(&display_sender, "Mode Save Failed");
+                }
+            },
         }
     }
 }
@@ -105,46 +158,72 @@ pub async fn wifi_ready_task(
     stack: embassy_net::Stack<'static>,
     display_sender: DisplaySender,
 ) {
-    // Wait for link to be up
     let mut period_count: u8 = 0;
     loop {
-        if stack.is_link_up() {
-            break;
+        if !wifi_mode_requested() || !wifi_started() {
+            Timer::after(Duration::from_millis(500)).await;
+            continue;
         }
-        period_count = (period_count + 1) % 4;
-        update_dots(&display_sender, period_count);
-        match period_count {
-            0 => println!("Waiting for link"),
-            1 => println!("Waiting for link."),
-            2 => println!("Waiting for link.."),
-            _ => println!("Waiting for link..."),
-        }
-        Timer::after(Duration::from_millis(1000)).await;
-    }
 
-    println!("Waiting to get IP address...");
-    update_status(&display_sender, WifiStatus::GettingIP);
-    period_count = 0;
-    loop {
-        if let Some(config) = stack.config_v4() {
-            println!("Got IP: {}", config.address);
-            let ip = config.address.address();
-            update_ip(&display_sender, ip.octets());
-            break;
+        while !stack.is_link_up() {
+            if !wifi_mode_requested() || !wifi_started() {
+                break;
+            }
+            period_count = (period_count + 1) % 4;
+            update_dots(&display_sender, period_count);
+            match period_count {
+                0 => println!("Waiting for link"),
+                1 => println!("Waiting for link."),
+                2 => println!("Waiting for link.."),
+                _ => println!("Waiting for link..."),
+            }
+            Timer::after(Duration::from_millis(1000)).await;
         }
-        period_count = (period_count + 1) % 4;
-        update_dots(&display_sender, period_count);
-        match period_count {
-            0 => println!("Getting IP"),
-            1 => println!("Getting IP."),
-            2 => println!("Getting IP.."),
-            _ => println!("Getting IP..."),
-        }
-        Timer::after(Duration::from_millis(1000)).await;
-    }
 
-    println!("WiFi connected successfully!");
-    spawner.spawn(http_server_task(stack)).ok();
+        if !wifi_mode_requested() || !wifi_started() {
+            continue;
+        }
+
+        println!("Waiting to get IP address...");
+        println!(
+            "[Heap] link up, before DHCP: {} bytes free",
+            esp_alloc::HEAP.free()
+        );
+        update_status(&display_sender, WifiStatus::GettingIP);
+        period_count = 0;
+        while stack.is_link_up() {
+            if !wifi_mode_requested() || !wifi_started() {
+                break;
+            }
+            if let Some(config) = stack.config_v4() {
+                println!("Got IP: {}", config.address);
+                println!("[Heap] after DHCP: {} bytes free", esp_alloc::HEAP.free());
+                println!("[WiFi] HTTP server active");
+                let ip = config.address.address();
+                update_ip(&display_sender, ip.octets());
+                println!("WiFi connected successfully!");
+                spawner.spawn(http_server_task(stack)).ok();
+                return;
+            }
+            period_count = (period_count + 1) % 4;
+            update_dots(&display_sender, period_count);
+            match period_count {
+                0 => println!("Getting IP ([Heap] {} bytes free)", esp_alloc::HEAP.free()),
+                1 => println!("Getting IP. ([Heap] {} bytes free)", esp_alloc::HEAP.free()),
+                2 => println!(
+                    "Getting IP.. ([Heap] {} bytes free)",
+                    esp_alloc::HEAP.free()
+                ),
+                _ => println!(
+                    "Getting IP... ([Heap] {} bytes free)",
+                    esp_alloc::HEAP.free()
+                ),
+            }
+            Timer::after(Duration::from_millis(1000)).await;
+        }
+
+        println!("[WiFi] link lost before DHCP; waiting for reconnect");
+    }
 }
 
 /// WiFi connect / reconnect state machine.
@@ -164,7 +243,12 @@ pub async fn wifi_connection_task(
     let mut current_password: heapless::String<MAX_PASSWORD_LEN> =
         heapless::String::try_from(PASSWORD).unwrap_or_default();
 
-    match select(WIFI_RECONNECT.wait(), Timer::after(Duration::from_millis(500))).await {
+    match select(
+        WIFI_RECONNECT.wait(),
+        Timer::after(Duration::from_millis(500)),
+    )
+    .await
+    {
         Either::First((ssid, password)) => {
             println!(
                 "[WiFi] Using stored credentials from boot: SSID='{}'",
@@ -184,6 +268,34 @@ pub async fn wifi_connection_task(
     let mut needs_reconfigure = true;
 
     loop {
+        if !wifi_mode_requested() {
+            if matches!(sta_state(), WifiStaState::Connected) {
+                println!("[WiFi] BLE mode requested; disconnecting WiFi...");
+                let _ = controller.disconnect_async().await;
+                Timer::after(Duration::from_millis(500)).await;
+            }
+            if matches!(controller.is_started(), Ok(true)) {
+                println!("[WiFi] BLE mode requested; stopping WiFi...");
+                let _ = controller.stop_async().await;
+                WIFI_STARTED.store(false, Ordering::Relaxed);
+                Timer::after(Duration::from_millis(500)).await;
+            }
+
+            if WIFI_RECONNECT.signaled() {
+                let (new_ssid, new_password) = WIFI_RECONNECT.wait().await;
+                println!(
+                    "[WiFi] Credentials updated while in BLE mode: SSID='{}'",
+                    new_ssid.as_str()
+                );
+                current_ssid = new_ssid;
+                current_password = new_password;
+                needs_reconfigure = true;
+            }
+
+            Timer::after(Duration::from_millis(250)).await;
+            continue;
+        }
+
         // Check if new credentials are available (non-blocking check)
         if WIFI_RECONNECT.signaled() {
             let (new_ssid, new_password) = WIFI_RECONNECT.wait().await;
@@ -207,6 +319,7 @@ pub async fn wifi_connection_task(
                 if matches!(controller.is_started(), Ok(true)) {
                     println!("[WiFi] Stopping WiFi for reconfiguration...");
                     let _ = controller.stop_async().await;
+                    WIFI_STARTED.store(false, Ordering::Relaxed);
                     Timer::after(Duration::from_millis(500)).await;
                 }
             }
@@ -216,7 +329,7 @@ pub async fn wifi_connection_task(
             WifiStaState::Connected => {
                 match select(
                     controller.wait_for_event(WifiEvent::StaDisconnected),
-                    WIFI_RECONNECT.wait(),
+                    Timer::after(Duration::from_millis(250)),
                 )
                 .await
                 {
@@ -224,29 +337,9 @@ pub async fn wifi_connection_task(
                         println!("[WiFi] Disconnected from network");
                         Timer::after(Duration::from_millis(5000)).await;
                     }
-                    Either::Second((new_ssid, new_password)) => {
-                        println!(
-                            "[WiFi] New credentials while connected: SSID='{}'",
-                            new_ssid.as_str()
-                        );
-                        if new_ssid.as_str() != current_ssid.as_str()
-                            || new_password.as_str() != current_password.as_str()
-                        {
-                            current_ssid = new_ssid;
-                            current_password = new_password;
-                            needs_reconfigure = true;
-
-                            println!("[WiFi] Disconnecting to switch networks...");
-                            let _ = controller.disconnect_async().await;
-                            Timer::after(Duration::from_millis(1000)).await;
-
-                            if matches!(controller.is_started(), Ok(true)) {
-                                let _ = controller.stop_async().await;
-                                Timer::after(Duration::from_millis(500)).await;
-                            }
-                        }
-                    }
+                    Either::Second(_) => {}
                 }
+                continue;
             }
             _ => {}
         }
@@ -260,11 +353,24 @@ pub async fn wifi_connection_task(
             controller.set_config(&client_config).unwrap();
             needs_reconfigure = false;
             println!("Starting WiFi...");
+            println!(
+                "[Heap] before WiFi start: {} bytes free",
+                esp_alloc::HEAP.free()
+            );
             controller.start_async().await.unwrap();
+            WIFI_STARTED.store(true, Ordering::Relaxed);
             println!("WiFi started!");
+            println!(
+                "[Heap] after WiFi start: {} bytes free",
+                esp_alloc::HEAP.free()
+            );
         }
 
         println!("Connecting to WiFi network: {}", current_ssid.as_str());
+        println!(
+            "[Heap] before WiFi connect: {} bytes free",
+            esp_alloc::HEAP.free()
+        );
 
         let mut period_count: u8 = 0;
         let mut new_creds_arrived = false;
@@ -279,6 +385,12 @@ pub async fn wifi_connection_task(
             {
                 Either::First(result) => break Some(result),
                 Either::Second(_) => {
+                    if !wifi_mode_requested() {
+                        println!("[WiFi] BLE mode requested during connection, will stop");
+                        new_creds_arrived = true;
+                        break None;
+                    }
+
                     // Check for new credentials during connection attempt
                     if WIFI_RECONNECT.signaled() {
                         println!("[WiFi] New credentials during connection, will restart");
@@ -303,7 +415,13 @@ pub async fn wifi_connection_task(
         }
 
         match result {
-            Some(Ok(_)) => println!("WiFi connected!"),
+            Some(Ok(_)) => {
+                println!("WiFi connected!");
+                println!(
+                    "[Heap] after WiFi connect: {} bytes free",
+                    esp_alloc::HEAP.free()
+                );
+            }
             Some(Err(e)) => {
                 println!("Failed to connect to WiFi: {:?}", e);
                 Timer::after(Duration::from_millis(5000)).await;

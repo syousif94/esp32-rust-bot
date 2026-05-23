@@ -14,7 +14,6 @@ use esp_hal::{
     clock::CpuClock,
     gpio::{Level, Output, OutputConfig},
     ledc::Ledc,
-    rng::Rng,
     timer::timg::TimerGroup,
     uart::{Config as UartConfig, Uart},
 };
@@ -28,12 +27,16 @@ use esp_storage::FlashStorage;
 use heapless::Vec as HVec;
 use static_cell::StaticCell;
 
+use esp32_http_servo::ble::ble_task;
 #[cfg(feature = "four_motor")]
 use esp32_http_servo::brushless::BrushlessMotor;
 #[cfg(feature = "two_motor")]
 use esp32_http_servo::brushless::TB6612Motor;
 use esp32_http_servo::brushless::{MotorControl, init_motor_timer};
-use esp32_http_servo::commands::{COMMANDS, Command, MOTOR_COUNT};
+use esp32_http_servo::commands::{
+    COMMANDS, Command, MOTOR_COUNT, complete_battery_sample_request,
+    wait_for_battery_sample_request,
+};
 #[cfg(feature = "four_motor")]
 use esp32_http_servo::display::display_task;
 use esp32_http_servo::display::{DisplaySender, init_display_state, update_motor};
@@ -41,11 +44,12 @@ use esp32_http_servo::st3215::{
     MAX_SERVOS, SHARED_BUS, SHARED_LIST, ServoList, SharedBus, SharedList, St3215Bus,
 };
 
-use esp32_http_servo::ble::ble_task;
 use esp32_http_servo::serial_cmd::serial_input_task;
 use esp32_http_servo::wifi::{
-    default_ssid, net_task, wifi_config_task, wifi_connection_task, wifi_ready_task,
+    net_task, request_ble_mode, request_wifi_mode, wifi_config_task, wifi_connection_task,
+    wifi_ready_task,
 };
+use esp32_http_servo::wifi_config::{RadioMode, read_radio_mode};
 
 // Required by the esp-idf bootloader.
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -72,6 +76,10 @@ async fn main(spawner: Spawner) -> ! {
     // Keep some stack headroom below the stack-breaking 64K setting, but give
     // WiFi enough normal heap that ARP/TCP stay responsive after DHCP.
     esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: 60 * 1024);
+    println!(
+        "[Heap] after heap init: {} bytes free",
+        esp_alloc::HEAP.free()
+    );
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
 
@@ -221,7 +229,7 @@ async fn main(spawner: Spawner) -> ! {
         spawner.spawn(ina219_task(ina_i2c)).ok();
     }
 
-    let display_sender = init_display_state(default_ssid());
+    let display_sender = init_display_state("BLE Ready");
     println!("Boot: display state initialized");
 
     #[cfg(feature = "four_motor")]
@@ -230,41 +238,70 @@ async fn main(spawner: Spawner) -> ! {
         println!("OLED display task spawned");
     }
 
-    // -- Radio (WiFi + BLE) ---------------------------------------------
+    // -- Radio (BLE by default, persisted WiFi/BLE selected by serial) ----
     println!("Boot: initializing radio controller");
     let esp_radio_controller =
         mk_static!(esp_radio::Controller<'static>, esp_radio::init().unwrap());
     println!("Boot: radio controller initialized");
+    println!(
+        "[Heap] after radio init: {} bytes free",
+        esp_alloc::HEAP.free()
+    );
 
-    println!("Boot: initializing BLE connector");
-    let connector =
-        BleConnector::new(esp_radio_controller, peripherals.BT, Default::default()).unwrap();
-    println!("BLE connector initialized");
+    let flash_storage = mk_static!(FlashStorage<'static>, FlashStorage::new(peripherals.FLASH));
+    let radio_mode = read_radio_mode(flash_storage);
+    println!("Boot: selected radio mode: {:?}", radio_mode);
 
-    let wifi_cfg = esp_radio::wifi::Config::default();
+    spawner
+        .spawn(wifi_config_task(flash_storage, display_sender.clone()))
+        .ok();
+
+    if radio_mode == RadioMode::Ble {
+        request_ble_mode();
+        println!("Boot: initializing BLE connector");
+        let connector =
+            BleConnector::new(esp_radio_controller, peripherals.BT, Default::default()).unwrap();
+        println!("BLE connector initialized");
+        println!(
+            "[Heap] after BLE connector init: {} bytes free",
+            esp_alloc::HEAP.free()
+        );
+
+        spawner.spawn(ble_task(connector)).ok();
+        println!("Boot: BLE task spawned");
+    } else {
+        request_wifi_mode();
+        println!("Boot: BLE disabled for WiFi mode");
+    }
+
+    let wifi_cfg = esp_radio::wifi::Config::default()
+        .with_rx_queue_size(2)
+        .with_tx_queue_size(2)
+        .with_static_rx_buf_num(2)
+        .with_dynamic_rx_buf_num(4)
+        .with_dynamic_tx_buf_num(4)
+        .with_ampdu_rx_enable(false)
+        .with_ampdu_tx_enable(false)
+        .with_rx_ba_win(2);
     let (controller, interfaces) =
         esp_radio::wifi::new(esp_radio_controller, peripherals.WIFI, wifi_cfg).unwrap();
     println!("Boot: WiFi interface initialized");
+    println!(
+        "[Heap] after WiFi interface init: {} bytes free",
+        esp_alloc::HEAP.free()
+    );
 
     let net_config = embassy_net::Config::dhcpv4(Default::default());
-    let rng = Rng::new();
-    let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+    let seed = 0x5eed_cafe_1f0c_0068;
 
     let (stack, runner) = embassy_net::new(
         interfaces.sta,
         net_config,
-        mk_static!(StackResources<5>, StackResources::<5>::new()),
+        mk_static!(StackResources<3>, StackResources::<3>::new()),
         seed,
     );
     println!("Boot: network stack initialized");
 
-    let flash_storage = mk_static!(FlashStorage<'static>, FlashStorage::new(peripherals.FLASH));
-
-    // -- Spawn background tasks -----------------------------------------
-    spawner.spawn(ble_task(connector)).ok();
-    spawner
-        .spawn(wifi_config_task(flash_storage, display_sender.clone()))
-        .ok();
     spawner
         .spawn(wifi_connection_task(controller, display_sender.clone()))
         .ok();
@@ -272,7 +309,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner
         .spawn(wifi_ready_task(spawner, stack, display_sender.clone()))
         .ok();
-    println!("Boot: WiFi tasks spawned");
+    println!("Boot: WiFi tasks spawned (idle until serial `wi`)");
 
     // -- Boot scan for ST3215 servos -----------------------------------
     // Give peripherals a moment to settle.
@@ -363,8 +400,9 @@ async fn ina219_task(mut i2c: I2c<'static, esp_hal::Blocking>) {
         Err(e) => println!("INA219 not responding: {:?}", e),
     }
 
-    let mut buf = [0u8; 2];
     loop {
+        wait_for_battery_sample_request().await;
+        let mut buf = [0u8; 2];
         match i2c.write_read(INA219_ADDR, &[INA219_REG_BUS_VOLTAGE], &mut buf) {
             Ok(()) => {
                 let raw = u16::from_be_bytes(buf);
@@ -382,7 +420,7 @@ async fn ina219_task(mut i2c: I2c<'static, esp_hal::Blocking>) {
                 println!("INA219 read error: {:?}", e);
             }
         }
-        Timer::after(Duration::from_secs(2)).await;
+        complete_battery_sample_request();
     }
 }
 

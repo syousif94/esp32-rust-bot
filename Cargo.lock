@@ -944,6 +944,7 @@ dependencies = [
  "esp-radio",
  "esp-rtos",
  "esp-storage",
+ "esp-wifi-sys",
  "heapless 0.8.0",
  "ssd1306",
  "static_cell",

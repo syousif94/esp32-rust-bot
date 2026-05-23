@@ -15,14 +15,18 @@
 //!   st <id> setid <new>            — change servo ID (auto-rescans)
 //!   st <id> ping                   — ping a single servo
 //!   st <id> state                  — read pos/speed/load/V/T
+//!   wifi <ssid> <password>         — save WiFi credentials
+//!   wi | ble                       — switch radio preference / WiFi link
 
 use embassy_time::{Duration, Timer};
 use esp_hal::Blocking;
 use esp_hal::uart::Uart;
 use esp_println::println;
 
+use crate::ble::BLE_WIFI_CREDENTIALS;
 use crate::commands::{Command, MOTOR_COUNT, MotorId, send_command};
 use crate::st3215::MAX_SERVOS;
+use crate::wifi_config::{MAX_PASSWORD_LEN, MAX_SSID_LEN, RADIO_MODE_REQUEST, RadioMode};
 
 const ST_DEFAULT_SPEED: u16 = 1500;
 const ST_DEFAULT_ACC: u8 = 50;
@@ -249,6 +253,47 @@ fn dispatch(cmd: &str) {
         return;
     }
 
+    if cmd == "wi" {
+        RADIO_MODE_REQUEST.signal(RadioMode::Wifi);
+        println!("\nSerial: saving WiFi mode and rebooting");
+        return;
+    }
+
+    if cmd == "ble" {
+        RADIO_MODE_REQUEST.signal(RadioMode::Ble);
+        println!("\nSerial: saving BLE mode and rebooting");
+        return;
+    }
+
+    if let Some(rest) = cmd.strip_prefix("wifi ") {
+        let mut parts = rest.split_whitespace();
+        let Some(ssid_part) = parts.next() else {
+            println!("usage: wifi <ssid> <password>");
+            return;
+        };
+        let Some(password_part) = parts.next() else {
+            println!("usage: wifi <ssid> <password>");
+            return;
+        };
+        if parts.next().is_some() {
+            println!("usage: wifi <ssid> <password>");
+            return;
+        }
+
+        let Ok(ssid) = heapless::String::<MAX_SSID_LEN>::try_from(ssid_part) else {
+            println!("WiFi SSID too long (max {} bytes)", MAX_SSID_LEN);
+            return;
+        };
+        let Ok(password) = heapless::String::<MAX_PASSWORD_LEN>::try_from(password_part) else {
+            println!("WiFi password too long (max {} bytes)", MAX_PASSWORD_LEN);
+            return;
+        };
+
+        BLE_WIFI_CREDENTIALS.signal((ssid, password));
+        println!("\nSerial: WiFi credentials queued");
+        return;
+    }
+
     // Try motor commands first
     if let Some((motor, power)) = parse_motor_token(cmd) {
         match motor {
@@ -295,6 +340,7 @@ fn dispatch(cmd: &str) {
     println!(
         "  Servos: st list | st scan | st all <id>=<pos> ... | st <id> pos <v> | st <id> torque <0|1> | st <id> setid <new> | st <id> ping"
     );
+    println!("  Radio: wifi <ssid> <password> | wi | ble");
 }
 
 #[embassy_executor::task]
@@ -311,8 +357,9 @@ pub async fn serial_input_task(mut uart: Uart<'static, Blocking>) {
     println!(
         "  Servos: st list | st scan | st all <id>=<pos> ... | st <id> pos <v> | st <id> torque <0|1> | st <id> setid <new> | st <id> ping"
     );
+    println!("  Radio: wifi <ssid> <password> | wi | ble");
 
-    let mut buffer = [0u8; 96];
+    let mut buffer = [0u8; 128];
     let mut pos = 0usize;
     let mut read_buf = [0u8; 1];
 
