@@ -49,6 +49,12 @@
       .battery.mid  { color: #fa0; }
       .battery.low  { color: #f44; }
 
+      .radio-actions {
+        position: fixed;
+        top: 44px; right: 12px;
+        z-index: 10;
+      }
+
       h2 {
         font-size: 12px;
         text-transform: uppercase;
@@ -224,6 +230,9 @@
   <body>
     <div class="status" id="status">Connecting…</div>
     <div class="battery" id="battery">--% &middot; --.--V</div>
+    <div class="radio-actions">
+      <button class="btn danger" id="ble-mode-btn" type="button">Switch to BLE</button>
+    </div>
 
     <!-- Joystick panel -->
     <div class="panel">
@@ -266,6 +275,35 @@
     <script>
       const baseUrl = `http://${window.location.host}`;
       const statusEl = document.getElementById('status');
+      const bleModeBtn = document.getElementById('ble-mode-btn');
+
+      async function checkConnection() {
+        try {
+          const c = new AbortController();
+          const t = setTimeout(() => c.abort(), 1000);
+          const res = await fetch(`${baseUrl}/health`, { signal: c.signal });
+          clearTimeout(t);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          statusEl.textContent = 'Connected';
+          statusEl.className = 'status ok';
+        } catch (e) {
+          statusEl.textContent = 'Offline';
+          statusEl.className = 'status err';
+        }
+      }
+
+      bleModeBtn.addEventListener('click', async () => {
+        if (!confirm('Switch to BLE mode and reboot now?')) return;
+        bleModeBtn.disabled = true;
+        statusEl.textContent = 'Switching to BLE…';
+        statusEl.className = 'status ok';
+        try {
+          await fetch(`${baseUrl}/radio/ble`);
+          statusEl.textContent = 'Rebooting to BLE…';
+        } catch (e) {
+          statusEl.textContent = 'Rebooting to BLE…';
+        }
+      });
 
       // -------------------------------------------------------------------
       // Joystick
@@ -626,6 +664,7 @@
       }
 
       // -- Boot ---------------------------------------------------------
+  checkConnection();
       loadList();
       pollBattery();
       setInterval(pollBattery, 5000);

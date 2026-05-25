@@ -2,7 +2,7 @@
 
 This document covers the control interfaces exposed by the ESP32: a **serial console**, a **REST API** over WiFi, and a **BLE GATT** service. All interfaces control the same motors and ST3215 bus servos; commands from any source are handled identically.
 
-Bluetooth is the default radio mode after boot. WiFi credentials can be stored over serial or BLE. The serial `wi` and `ble` commands store the requested boot mode in flash and reboot into WiFi or BLE; this does not require separate BLE and WiFi firmware images.
+Bluetooth is the default radio mode after boot. WiFi credentials can be stored over serial or BLE. The serial `wi` and `ble` commands store the requested boot mode in flash and reboot into WiFi or BLE; this does not require separate BLE and WiFi firmware images. When WiFi boot mode is persisted, the device tries WiFi first on every boot. If it has not obtained an IP address after 10 seconds, it starts BLE advertising for that boot without changing the persisted WiFi mode.
 
 The firmware supports two motor configurations selected at compile time via Cargo features:
 
@@ -41,7 +41,7 @@ UART0 accepts line-oriented commands. Press Enter after each command.
 | `wi`                     | Store WiFi boot mode and reboot using stored credentials |
 | `ble`                    | Store BLE boot mode and reboot into BLE advertising |
 
-Serial WiFi credentials use whitespace-separated arguments, so SSIDs and passwords containing spaces are not supported by the serial command. Use the BLE WiFi Config characteristic if you need spaces. Radio mode persists until changed with `wi` or `ble`.
+Serial WiFi credentials use whitespace-separated arguments, so SSIDs and passwords containing spaces are not supported by the serial command. Use the BLE WiFi Config characteristic if you need spaces. Radio mode persists until changed with `wi` or `ble`. In persisted WiFi mode, BLE advertising is still started as a fallback if WiFi has not obtained an IP address within 10 seconds; the next reboot will try WiFi first again.
 
 ### Motors And Servos
 
@@ -108,6 +108,16 @@ Returns the motor configuration for this firmware build.
 ```
 
 Use this endpoint on connect to discover how many motors are available and adapt your UI accordingly.
+
+#### `GET /radio/ble`
+
+Stores BLE as the boot radio mode and reboots into BLE advertising. This is the WiFi/controller equivalent of the serial `ble` command.
+
+**Response** `200 OK`
+
+```json
+{ "ok": true, "mode": "ble", "rebooting": true }
+```
 
 #### `GET /battery`
 

@@ -22,7 +22,7 @@ use crate::display::{
     DisplaySender, WifiStatus, set_line1_override, update_dots, update_ip, update_ssid,
     update_status,
 };
-use crate::http_server::http_server_task;
+use crate::http_server::{WEB_TASK_POOL_SIZE, WebApp, web_task};
 use crate::wifi_config::{
     MAX_PASSWORD_LEN, MAX_SSID_LEN, RADIO_MODE_REQUEST, read_wifi_credentials, write_radio_mode,
     write_wifi_credentials,
@@ -202,7 +202,12 @@ pub async fn wifi_ready_task(
                 let ip = config.address.address();
                 update_ip(&display_sender, ip.octets());
                 println!("WiFi connected successfully!");
-                spawner.spawn(http_server_task(stack)).ok();
+                let web_app = WebApp::default();
+                for task_id in 0..WEB_TASK_POOL_SIZE {
+                    spawner
+                        .spawn(web_task(task_id, stack, web_app.router, web_app.config))
+                        .ok();
+                }
                 return;
             }
             period_count = (period_count + 1) % 4;

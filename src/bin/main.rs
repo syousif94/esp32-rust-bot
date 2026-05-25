@@ -44,6 +44,7 @@ use esp32_http_servo::st3215::{
     MAX_SERVOS, SHARED_BUS, SHARED_LIST, ServoList, SharedBus, SharedList, St3215Bus,
 };
 
+use esp32_http_servo::http_server::WEB_TASK_POOL_SIZE;
 use esp32_http_servo::serial_cmd::serial_input_task;
 use esp32_http_servo::wifi::{
     net_task, request_ble_mode, request_wifi_mode, wifi_config_task, wifi_connection_task,
@@ -60,6 +61,8 @@ macro_rules! mk_static {
         STATIC_CELL.uninit().write($val)
     }};
 }
+
+const NET_SOCKET_COUNT: usize = WEB_TASK_POOL_SIZE + 1;
 
 // ---------------------------------------------------------------------------
 // Main
@@ -256,7 +259,7 @@ async fn main(spawner: Spawner) -> ! {
         .spawn(wifi_config_task(flash_storage, display_sender.clone()))
         .ok();
 
-    if radio_mode == RadioMode::Ble {
+    let ble_fallback_connector = if radio_mode == RadioMode::Ble {
         request_ble_mode();
         println!("Boot: initializing BLE connector");
         let connector =
@@ -269,10 +272,15 @@ async fn main(spawner: Spawner) -> ! {
 
         spawner.spawn(ble_task(connector)).ok();
         println!("Boot: BLE task spawned");
+        None
     } else {
         request_wifi_mode();
-        println!("Boot: BLE disabled for WiFi mode");
-    }
+        println!("Boot: initializing BLE connector for WiFi fallback");
+        let connector =
+            BleConnector::new(esp_radio_controller, peripherals.BT, Default::default()).unwrap();
+        println!("Boot: BLE fallback armed for WiFi mode");
+        Some(connector)
+    };
 
     let wifi_cfg = esp_radio::wifi::Config::default()
         .with_rx_queue_size(2)
@@ -297,7 +305,10 @@ async fn main(spawner: Spawner) -> ! {
     let (stack, runner) = embassy_net::new(
         interfaces.sta,
         net_config,
-        mk_static!(StackResources<3>, StackResources::<3>::new()),
+        mk_static!(
+            StackResources<NET_SOCKET_COUNT>,
+            StackResources::<NET_SOCKET_COUNT>::new()
+        ),
         seed,
     );
     println!("Boot: network stack initialized");
@@ -309,6 +320,11 @@ async fn main(spawner: Spawner) -> ! {
     spawner
         .spawn(wifi_ready_task(spawner, stack, display_sender.clone()))
         .ok();
+    if let Some(connector) = ble_fallback_connector {
+        spawner
+            .spawn(wifi_ble_fallback_task(spawner, stack, connector))
+            .ok();
+    }
     println!("Boot: WiFi tasks spawned (idle until serial `wi`)");
 
     // -- Boot scan for ST3215 servos -----------------------------------
@@ -318,6 +334,24 @@ async fn main(spawner: Spawner) -> ! {
 
     // -- Command loop ---------------------------------------------------
     command_loop(&mut motors, &display_sender).await
+}
+
+#[embassy_executor::task]
+async fn wifi_ble_fallback_task(
+    spawner: Spawner,
+    stack: embassy_net::Stack<'static>,
+    connector: BleConnector<'static>,
+) {
+    Timer::after(Duration::from_secs(10)).await;
+
+    if stack.config_v4().is_some() {
+        println!("[WiFi] connected within 10s; BLE fallback not needed");
+        return;
+    }
+
+    println!("[WiFi] no network after 10s; starting BLE advertising fallback");
+    request_ble_mode();
+    spawner.spawn(ble_task(connector)).ok();
 }
 
 /// Re-scan the ST3215 bus and update the shared list.

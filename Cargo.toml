@@ -27,6 +27,7 @@ static_cell = "2.1.1"
 embassy-sync = "0.7.2"
 embassy-futures = "0.1.2"
 embedded-io = "0.7.1"
+picoserve = { version = "0.18.0", features = ["alloc", "embassy"] }
 
 # OLED display support
 embedded-graphics = "0.8"
