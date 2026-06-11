@@ -29,6 +29,7 @@ const CONNECTIONS_MAX: usize = 1;
 
 /// Max number of L2CAP channels (Signal + ATT)
 const L2CAP_CHANNELS_MAX: usize = 2;
+const ST_MAX_WHEEL_SPEED: i16 = 4095;
 
 /// WiFi credentials received via BLE (SSID, password as heapless strings)
 pub type WifiCredentialsData = (
@@ -381,6 +382,24 @@ async fn handle_st_cmd<P: PacketPool>(
             let pos = u16::from_le_bytes([data[1], data[2]]);
             let speed = u16::from_le_bytes([data[3], data[4]]);
             move_discovered(pos, speed, data[5]).await;
+        }
+        0x08 => {
+            send_command(Command::St3215Zero { id: data[1] });
+        }
+        0x09 => {
+            let speed = i16::from_le_bytes([data[2], data[3]]);
+            if !(-ST_MAX_WHEEL_SPEED..=ST_MAX_WHEEL_SPEED).contains(&speed) {
+                println!("[BLE] st_cmd: wheel speed {} out of range", speed);
+                return;
+            }
+            send_command(Command::St3215Wheel {
+                id: data[1],
+                speed,
+                acc: data[4],
+            });
+        }
+        0x0A => {
+            send_command(Command::St3215ServoMode { id: data[1] });
         }
         _ => println!("[BLE] st_cmd: unknown op 0x{:02X}", op),
     }

@@ -12,6 +12,10 @@
 //!   st <id> pos <v>                — move servo to pos 0..=4095
 //!     [speed <s>] [acc <a>]         (alias: st <id> p <v>)
 //!   st <id> torque <0|1>           — enable/disable torque (alias t)
+//!   st <id> zero                   — calibrate current position as zero/home
+//!   st <id> wheel <speed>          — continuous rotation signed speed
+//!     [acc <a>]                     (speed -4095..=4095, 0 stops)
+//!   st <id> servo                  — switch back to position-control mode
 //!   st <id> setid <new>            — change servo ID (auto-rescans)
 //!   st <id> ping                   — ping a single servo
 //!   st <id> state                  — read pos/speed/load/V/T
@@ -31,6 +35,7 @@ use crate::wifi_config::{MAX_PASSWORD_LEN, MAX_SSID_LEN, RADIO_MODE_REQUEST, Rad
 const ST_DEFAULT_SPEED: u16 = 1500;
 const ST_DEFAULT_ACC: u8 = 50;
 const ST_MAX_POS: u16 = 4095;
+const ST_MAX_WHEEL_SPEED: i16 = 4095;
 
 fn parse_motor_token(input: &str) -> Option<(char, i8)> {
     let input = input.trim();
@@ -166,7 +171,7 @@ fn parse_st(input: &str) -> bool {
         return true;
     };
     if tcount < 2 {
-        println!("usage: st <id> <pos|p|torque|t|setid|ping|state> ...");
+        println!("usage: st <id> <pos|p|torque|t|zero|wheel|servo|setid|ping|state> ...");
         return true;
     }
     match toks[1] {
@@ -215,6 +220,39 @@ fn parse_st(input: &str) -> bool {
             let enable = matches!(*v, "1" | "on" | "true");
             send_command(Command::St3215Torque { id, enable });
             println!("Serial: st {} torque={}", id, enable);
+        }
+        "zero" => {
+            send_command(Command::St3215Zero { id });
+            println!("Serial: st {} zero calibration requested", id);
+        }
+        "wheel" | "w" => {
+            let Some(speed) = toks.get(2).and_then(|s| s.parse::<i16>().ok()) else {
+                println!("usage: st <id> wheel <-4095..=4095> [acc <a>]");
+                return true;
+            };
+            if !(-ST_MAX_WHEEL_SPEED..=ST_MAX_WHEEL_SPEED).contains(&speed) {
+                println!("wheel speed must be -4095..=4095");
+                return true;
+            }
+            let mut acc = ST_DEFAULT_ACC;
+            let mut i = 3;
+            while i < tcount {
+                match toks[i] {
+                    "acc" => {
+                        if let Some(v) = toks.get(i + 1).and_then(|s| s.parse().ok()) {
+                            acc = v;
+                        }
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            send_command(Command::St3215Wheel { id, speed, acc });
+            println!("Serial: st {} wheel speed={} acc={}", id, speed, acc);
+        }
+        "servo" => {
+            send_command(Command::St3215ServoMode { id });
+            println!("Serial: st {} servo mode requested", id);
         }
         "setid" => {
             let Some(new) = toks.get(2).and_then(|s| s.parse::<u8>().ok()) else {

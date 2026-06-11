@@ -81,6 +81,20 @@ impl AppBuilder for Application {
                 ),
                 st_torque_handler(),
             )
+            .route(("/st", parse_path_segment::<u8>(), "/zero"), st_zero_handler())
+            .route(
+                (
+                    "/st",
+                    parse_path_segment::<u8>(),
+                    "/wheel",
+                    parse_path_segment::<i16>(),
+                ),
+                routing::get_service(StWheelService),
+            )
+            .route(
+                ("/st", parse_path_segment::<u8>(), "/mode", "/servo"),
+                st_servo_mode_handler(),
+            )
             .route(
                 ("/st", parse_path_segment::<u8>(), "/ping"),
                 st_ping_handler(),
@@ -165,6 +179,8 @@ fn query_u8(query: Query<'_>, name: &str) -> Option<u8> {
 fn query_u16(query: Query<'_>, name: &str) -> Option<u16> {
     query_value(query, name)?.parse().ok()
 }
+
+const ST_MAX_WHEEL_SPEED: i16 = 4095;
 
 fn is_valid_motor_id(c: char) -> bool {
     match c {
@@ -574,6 +590,110 @@ async fn st_torque_response(id: u8, enable: bool) -> JsonResponse {
             id,
             enable
         )),
+        Err(e) => json_response(
+            StatusCode::BAD_GATEWAY,
+            alloc::format!(r#"{{"ok":false,"id":{},"error":"{:?}"}}"#, id, e),
+        ),
+    }
+}
+
+fn st_zero_handler() -> impl routing::MethodHandler<(), (u8,)> {
+    routing::get(async |id: u8| {
+        println!("HTTP GET /st/{}/zero", id);
+        st_zero_response(id).await
+    })
+}
+
+async fn st_zero_response(id: u8) -> JsonResponse {
+    if !validate_st_id(id) {
+        return json_error(StatusCode::BAD_REQUEST, "Servo ID must be 1-253");
+    }
+    let Some(bus) = SHARED_BUS.try_get() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ST3215 bus not initialized",
+        );
+    };
+
+    let mut bus_guard = bus.lock().await;
+    match bus_guard.calibrate_zero(id).await {
+        Ok(()) => json_ok(alloc::format!(r#"{{"ok":true,"id":{},"zero":true}}"#, id)),
+        Err(e) => json_response(
+            StatusCode::BAD_GATEWAY,
+            alloc::format!(r#"{{"ok":false,"id":{},"error":"{:?}"}}"#, id, e),
+        ),
+    }
+}
+
+struct StWheelService;
+
+impl RequestHandlerService<(), (u8, i16)> for StWheelService {
+    async fn call_request_handler_service<R: Read, W: ResponseWriter<Error = R::Error>>(
+        &self,
+        _state: &(),
+        (id, speed): (u8, i16),
+        request: Request<'_, R>,
+        response_writer: W,
+    ) -> Result<ResponseSent, W::Error> {
+        println!("HTTP GET /st/{}/wheel/{}", id, speed);
+        st_wheel_response(id, speed, request.parts.query())
+            .await
+            .write_to(request.body_connection.finalize().await?, response_writer)
+            .await
+    }
+}
+
+async fn st_wheel_response(id: u8, speed: i16, query: Query<'_>) -> JsonResponse {
+    if !validate_st_id(id) || !(-ST_MAX_WHEEL_SPEED..=ST_MAX_WHEEL_SPEED).contains(&speed) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Servo ID must be 1-253 and wheel speed -4095..=4095",
+        );
+    }
+    let acc = query_u8(query, "acc").unwrap_or(50);
+    let Some(bus) = SHARED_BUS.try_get() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ST3215 bus not initialized",
+        );
+    };
+
+    let mut bus_guard = bus.lock().await;
+    match bus_guard.write_wheel_speed(id, speed, acc).await {
+        Ok(()) => json_ok(alloc::format!(
+            r#"{{"ok":true,"id":{},"wheel_speed":{},"acc":{}}}"#,
+            id,
+            speed,
+            acc
+        )),
+        Err(e) => json_response(
+            StatusCode::BAD_GATEWAY,
+            alloc::format!(r#"{{"ok":false,"id":{},"error":"{:?}"}}"#, id, e),
+        ),
+    }
+}
+
+fn st_servo_mode_handler() -> impl routing::MethodHandler<(), (u8,)> {
+    routing::get(async |id: u8| {
+        println!("HTTP GET /st/{}/mode/servo", id);
+        st_servo_mode_response(id).await
+    })
+}
+
+async fn st_servo_mode_response(id: u8) -> JsonResponse {
+    if !validate_st_id(id) {
+        return json_error(StatusCode::BAD_REQUEST, "Servo ID must be 1-253");
+    }
+    let Some(bus) = SHARED_BUS.try_get() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ST3215 bus not initialized",
+        );
+    };
+
+    let mut bus_guard = bus.lock().await;
+    match bus_guard.set_servo_mode(id).await {
+        Ok(()) => json_ok(alloc::format!(r#"{{"ok":true,"id":{},"mode":"servo"}}"#, id)),
         Err(e) => json_response(
             StatusCode::BAD_GATEWAY,
             alloc::format!(r#"{{"ok":false,"id":{},"error":"{:?}"}}"#, id, e),

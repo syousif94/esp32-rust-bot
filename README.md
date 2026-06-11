@@ -1,343 +1,243 @@
-# ESP32 HTTP Servo & Motor Controller
+# ESP32 ST3215 Motor Controller
 
-Control an SG90 servo motor and brushless DC motors via HTTP requests or serial commands using an ESP32 microcontroller, written in Rust with `no_std` embedded development.
+Rust `no_std` firmware for an ESP32 robot controller. It drives ST3215 serial-bus servos, H-bridge/TB6612 DC motors, optional battery telemetry, a serial console, a WiFi REST API, and a BLE GATT control service.
+
+Bluetooth is the default boot mode. WiFi credentials and the preferred radio mode are stored in flash, so the controller can be configured once and then boot directly into WiFi when requested.
+
+For the full endpoint and BLE characteristic reference, see [API.md](API.md).
 
 ## Features
 
-- **HTTP Control**: Set servo angle via GET requests (`/servo/90` or `/servo?angle=90`)
-- **Motor Control**: Control brushless motors via H-bridge (`/motor/a/50` or `/motor/b/-75`)
-- **Serial Control**: Type angle values directly in the serial monitor
-- **WiFi Connected**: Connects to your WiFi network and serves HTTP on port 80
-- **Async Runtime**: Uses Embassy for efficient async/await embedded programming
+- ST3215 bus servo control over UART1 at 1 Mbps.
+- Raw position moves, multi-servo sync-write moves, torque enable/disable, ID changes, ping, scan, state reads, zero calibration, wheel mode, and servo mode restore.
+- Motor control through a unified command channel shared by serial, HTTP, and BLE.
+- Default `two_motor` build for a TB6612 driver with optional INA219 battery telemetry.
+- Optional `four_motor` build for four H-bridge channels. This build is currently guarded in code because one motor pin conflicts with the ST3215 TX line.
+- BLE GATT service for motor writes, ST3215 commands, servo discovery, battery reads, and WiFi provisioning.
+- WiFi REST API and browser controller page when WiFi mode is selected.
+- 500 ms motor watchdog that stops DC motors if command updates stop. ST3215 servos are not watchdog-stopped because they hold position on the bus.
 
-## Hardware Requirements
+## Hardware
 
-- **ESP32** development board (tested with ESP32-WROOM)
-- **SG90 Servo Motor** (or compatible PWM servo)
-- **Brushless DC Motors** with H-bridge driver (e.g., L298N, TB6612FNG)
+- ESP32 development board.
+- ST3215 / SMS_STS-compatible serial-bus servos.
+- ST3215 half-duplex bus adapter, such as the Waveshare General Driver for Robots path used by this firmware.
+- TB6612 driver for the default two-motor build, or H-bridge drivers for the four-motor build.
+- Optional INA219 voltage monitor for the `two_motor` build.
+- Optional SSD1306 OLED display for the `four_motor` build.
 
-### Wiring
+### ST3215 Bus Wiring
 
-#### Servo
+UART1 is configured for the ST3215 bus at 1 Mbps, 8N1.
 
-| Servo Wire             | Connection              |
-| ---------------------- | ----------------------- |
-| Red (VCC)              | 3.3/5V power supply     |
-| Brown/Black (GND)      | GND (shared with ESP32) |
-| Orange/Yellow (Signal) | GPIO18                  |
+| Signal | ESP32 GPIO |
+| ------ | ---------- |
+| ST RX  | GPIO18     |
+| ST TX  | GPIO19     |
+| GND    | Shared GND |
 
-#### Brushless Motors (H-Bridge)
+Power ST3215 servos from an external supply sized for the servo load. Keep grounds common between the ESP32, servo supply, and motor drivers.
 
-| Motor   | Forward Pin | Reverse Pin | Description                  |
-| ------- | ----------- | ----------- | ---------------------------- |
-| Motor A | GPIO32      | GPIO33      | First motor H-bridge inputs  |
-| Motor B | GPIO25      | GPIO26      | Second motor H-bridge inputs |
+### Default Two-Motor Wiring
 
-Connect your H-bridge driver's input pins to the ESP32 GPIOs, and motor outputs to your brushless motors. Ensure proper power supply for the motors through the H-bridge.
+The default Cargo feature is `two_motor`, using a TB6612-style driver with STBY hardwired high.
 
-## Software Requirements
+| Motor | Direction Pins | PWM Pin |
+| ----- | -------------- | ------- |
+| A     | GPIO21, GPIO17 | GPIO25  |
+| B     | GPIO22, GPIO23 | GPIO26  |
 
-### Install Rust and ESP32 Toolchain
+Optional INA219 battery telemetry uses I2C0:
+
+| Signal | ESP32 GPIO |
+| ------ | ---------- |
+| SDA    | GPIO32     |
+| SCL    | GPIO33     |
+
+## Software Setup
+
+Install the ESP Rust toolchain and flashing tool:
 
 ```bash
-# Install Rust (if not already installed)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Install espup (ESP32 Rust toolchain installer)
 cargo install espup
-
-# Install the ESP32 toolchain
 espup install
-
-# Source the environment (add to your shell profile)
 source ~/export-esp.sh
-
-# Install cargo-espflash for flashing
 cargo install cargo-espflash
 ```
 
-### Configure WiFi
+## Build And Flash
 
-Edit `cfg.toml` with your WiFi credentials:
-
-```toml
-wifi_ssid = "YourNetworkName"
-wifi_password = "YourPassword"
-```
-
-## Building and Flashing
-
-Default firmware is BLE-first and does not start WiFi:
+Default build, with two motors and BLE-first boot behavior:
 
 ```bash
 cargo espflash flash --monitor
 ```
 
-Build the WiFi/webserver firmware explicitly when you want HTTP control:
+Explicit two-motor build:
 
 ```bash
-cargo espflash flash --features wifi --monitor
+cargo espflash flash --features two_motor --monitor
 ```
 
-## Usage
+WiFi support is compiled in by the firmware, but the device starts BLE by default unless persisted radio mode is set to WiFi. Use the serial `wi` command or BLE WiFi provisioning to switch.
 
-### HTTP Control
+## Radio Modes And WiFi Provisioning
 
-Once connected, the ESP32 will print its IP address. Use curl or a browser:
+The firmware stores radio preference and WiFi credentials in flash.
+
+Serial commands:
+
+```text
+wifi <ssid> <password>    # store WiFi credentials
+wi                        # store WiFi boot mode and reboot
+ble                       # store BLE boot mode and reboot
+```
+
+BLE provisioning writes credentials as `SSID\0PASSWORD` to the WiFi Config characteristic. This is the better path for SSIDs or passwords containing spaces.
+
+When WiFi mode is persisted, the ESP32 tries WiFi first on each boot. If it does not obtain an IP address within 10 seconds, BLE advertising starts as a fallback for that boot without changing the persisted mode.
+
+## Quick REST Examples
+
+After WiFi connects, the ESP32 serves HTTP on port 80. The root route returns the embedded controller page.
 
 ```bash
-# Servo Control
-# Move to 90 degrees (center)
-curl http://192.168.x.x/servo/90
+# Health and build configuration
+curl http://192.168.1.100/health
+curl http://192.168.1.100/config
 
-# Move to 0 degrees
-curl http://192.168.x.x/servo/0
+# Motors
+curl 'http://192.168.1.100/motors?a=60&b=-60'
+curl http://192.168.1.100/motor/a/0
 
-# Move to 180 degrees
-curl http://192.168.x.x/servo/180
+# Legacy angle route: maps 0-180 degrees to ST3215 ID 1 position 0-4095
+curl http://192.168.1.100/servo/90
 
-# Alternative query string format
-curl http://192.168.x.x/servo?angle=45
-
-# Motor Control (H-Bridge)
-# Motor A forward at 75% power
-curl http://192.168.x.x/motor/a/75
-
-# Motor A reverse at 50% power
-curl http://192.168.x.x/motor/a/-50
-
-# Motor B forward at 100% power
-curl http://192.168.x.x/motor/b/100
-
-# Stop Motor A
-curl http://192.168.x.x/motor/a/0
-
-# Alternative query string format
-curl http://192.168.x.x/motor/a?power=80
-
-# Check server status
-curl http://192.168.x.x/
+# ST3215 bus servos
+curl http://192.168.1.100/st/list
+curl 'http://192.168.1.100/st/scan?from=1&to=20'
+curl 'http://192.168.1.100/st/1/pos/2048?speed=1500&acc=50'
+curl 'http://192.168.1.100/st/all?1=2048&2=1024&speed=1500&acc=50'
+curl http://192.168.1.100/st/1/torque/1
+curl http://192.168.1.100/st/1/zero
+curl 'http://192.168.1.100/st/1/wheel/-1200?acc=50'
+curl http://192.168.1.100/st/1/mode/servo
+curl http://192.168.1.100/st/1/ping
+curl http://192.168.1.100/st/state
 ```
 
-**Response format** (JSON):
+Common REST responses are JSON. Successful ST3215 commands return `ok: true`; bus failures return an error string and a non-OK status where the operation needs a bus transaction.
 
-```json
-{ "angle": 90 }
-{ "motor": "a", "power": 75 }
+## Serial Console
+
+UART0 accepts line-oriented commands while monitoring with `cargo espflash flash --monitor`.
+
+```text
+# Motors
+m 0                         # set all motors
+ma 50                       # Motor A forward at 50%
+mb -75                      # Motor B reverse at 75%
+motor a 80                  # verbose motor form
+
+# ST3215 discovery and movement
+st list                     # scan 1..=20 and print discovered IDs
+st scan 1 40                # scan a custom ID range
+st 1 pos 2048 speed 1500 acc 50
+st all 1=2048 2=1024 speed 1500 acc 50
+
+# ST3215 maintenance and modes
+st 1 torque 1
+st 1 zero                   # calibrate current physical position as zero/home
+st 1 wheel -1200 acc 50     # continuous rotation, -4095..=4095
+st 1 servo                  # return to position-control mode
+st 1 setid 2
+st 1 ping
+st 1 state                  # serial pings; use HTTP /st/state for full state
 ```
 
-### Serial Control
+## BLE GATT API
 
-While connected via `cargo espflash flash --monitor`, type commands directly:
+The BLE peripheral advertises as `ESP32 Motor` and exposes service UUID `e3910040-4567-4321-abcd-abcdef012345`.
 
-```
-# Servo commands
-90           # Move servo to 90 degrees
-0            # Move servo to 0 degrees
-180          # Move servo to 180 degrees
-servo 45     # Also works
+| Characteristic | UUID                                   | Access            | Value                                                        |
+| -------------- | -------------------------------------- | ----------------- | ------------------------------------------------------------ |
+| Motors         | `e3910003-4567-4321-abcd-abcdef012345` | read/write/notify | 4 bytes, first `MOTOR_COUNT` bytes are signed motor powers   |
+| WiFi Config    | `e3910004-4567-4321-abcd-abcdef012345` | write             | `SSID\0PASSWORD`                                             |
+| Battery        | `e3910006-4567-4321-abcd-abcdef012345` | read              | `[percentage, voltage_mv_hi, voltage_mv_lo]`                 |
+| ST List        | `e3910011-4567-4321-abcd-abcdef012345` | read/notify       | 16 zero-padded discovered servo IDs                          |
+| ST Cmd         | `e3910012-4567-4321-abcd-abcdef012345` | write             | 6-byte command frames                                        |
+| ST State       | `e3910013-4567-4321-abcd-abcdef012345` | read              | `[id, err, pos_lo, pos_hi, load_lo, load_hi, voltage, temp]` |
 
-# Motor commands
-ma 50        # Motor A forward at 50%
-ma -75       # Motor A reverse at 75%
-mb 100       # Motor B forward at 100%
-mb 0         # Stop Motor B
-motor a 80   # Alternative format
-motor b -50  # Alternative format
-```
+ST Cmd opcodes:
+
+| Opcode | Frame                                           | Description                |
+| ------ | ----------------------------------------------- | -------------------------- |
+| `0x01` | `[op, id, pos_lo, pos_hi, speed_lo, speed_hi]`  | Move one servo             |
+| `0x02` | `[op, id, enable, 0, 0, 0]`                     | Torque on/off              |
+| `0x03` | `[op, current_id, new_id, 0, 0, 0]`             | Change servo ID            |
+| `0x04` | `[op, id, 0, 0, 0, 0]`                          | Ping                       |
+| `0x05` | `[op, id, 0, 0, 0, 0]`                          | Refresh ST State           |
+| `0x06` | `[op, from, to, 0, 0, 0]`                       | Rescan bus                 |
+| `0x07` | `[op, pos_lo, pos_hi, speed_lo, speed_hi, acc]` | Move all discovered servos |
+| `0x08` | `[op, id, 0, 0, 0, 0]`                          | Zero calibration           |
+| `0x09` | `[op, id, speed_lo, speed_hi, acc, 0]`          | Wheel mode signed speed    |
+| `0x0A` | `[op, id, 0, 0, 0, 0]`                          | Servo position mode        |
+
+## ST3215 Notes
+
+- Positions are raw ST3215 units, `0..=4095`.
+- Wheel speed is signed, `-4095..=4095`; `0` stops continuous rotation.
+- Zero calibration persists in the servo by writing the STS calibration command.
+- `GET /st/state` reads current position, speed, load, voltage, and temperature for discovered IDs.
+- Servo ID changes write EEPROM, then the firmware rescans IDs `1..=20`.
 
 ## Project Structure
 
-```
+```text
 src/
-├── bin/
-│   └── main.rs        # Entry point, WiFi setup, main loop
-├── lib.rs             # Library root
-├── brushless.rs       # H-bridge brushless motor control using LEDC
-├── http_server.rs     # HTTP server and request handling
-├── serial_cmd.rs      # Serial command parsing
-└── servo.rs           # PWM servo control using LEDC
+|-- bin/main.rs       # boot, peripherals, radio setup, ST3215 scan, command loop
+|-- ble.rs            # BLE GATT service and ST3215 command frames
+|-- brushless.rs      # motor driver abstractions for two/four motor builds
+|-- commands.rs       # unified command channel and shared telemetry state
+|-- display.rs        # optional OLED display state/task
+|-- http_server.rs    # picoserve REST API and embedded controller page
+|-- serial_cmd.rs     # UART0 command parser
+|-- st3215.rs         # ST3215/SMS_STS bus driver
+|-- wifi.rs           # WiFi tasks, web task startup, BLE fallback
+`-- wifi_config.rs    # persisted credentials and radio mode
 ```
 
-## How It Works
+## Execution Model
 
-### Servo Control (`servo.rs`)
+Input tasks do not drive hardware directly. HTTP, BLE, and serial all enqueue `Command` values into the global command channel. The main command loop owns actuator updates, serializes access to the ST3215 bus mutex, and applies the motor watchdog.
 
-The servo is controlled using the ESP32's **LEDC (LED Control)** peripheral, which generates PWM signals:
-
-- **Frequency**: 50 Hz (20ms period) - standard for hobby servos
-- **Duty Cycle**:
-  - 0° → 0.5ms pulse (2.5% duty)
-  - 90° → 1.5ms pulse (7.5% duty)
-  - 180° → 2.5ms pulse (12.5% duty)
-- **Resolution**: 14-bit for precise angle control
-- **Timer**: HighSpeed LEDC Timer0 with 80MHz APB clock
-
-### Brushless Motor Control (`brushless.rs`)
-
-Brushless motors are controlled via an H-bridge driver using two PWM channels per motor:
-
-- **Frequency**: 1 kHz - good for responsive H-bridge motor control
-- **Direction Control**:
-  - Forward: Pin A = PWM duty, Pin B = 0%
-  - Reverse: Pin A = 0%, Pin B = PWM duty
-  - Brake: Both pins = 0%
-- **Power Range**: -100% (full reverse) to +100% (full forward)
-- **Resolution**: 14-bit for smooth speed control
-- **Timer**: HighSpeed LEDC Timer1 (separate from servo)
-
-| Motor   | LEDC Channels | GPIO Pins  |
-| ------- | ------------- | ---------- |
-| Motor A | Channel 1, 2  | GPIO32, 33 |
-| Motor B | Channel 3, 4  | GPIO25, 26 |
-
-### HTTP Server (`http_server.rs`)
-
-A simple async TCP server running on port 80:
-
-1. Accepts TCP connections
-2. Parses HTTP GET requests
-3. Extracts angle from URL path or query string
-4. Signals the main loop via `embassy_sync::Signal`
-5. Returns JSON response
-
-**Endpoints**:
-
-- `GET /` - Server status
-- `GET /health` - Health check
-- `GET /servo/<angle>` - Set servo angle (0-180)
-- `GET /servo?angle=<angle>` - Alternative format
-- `GET /motor/a/<power>` - Set Motor A power (-100 to 100)
-- `GET /motor/b/<power>` - Set Motor B power (-100 to 100)
-- `GET /motor/a?power=<power>` - Alternative format
-- `GET /motor/b?power=<power>` - Alternative format
-
-### Serial Commands (`serial_cmd.rs`)
-
-Polls UART0 for input and parses servo and motor commands:
-
-- Runs as an Embassy task
-- Non-blocking read with `read_ready()` check
-- Echoes characters back to terminal
-
-**Servo formats**: `<angle>`, `servo <angle>`, `s <angle>`
-
-**Motor formats**: `ma <power>`, `mb <power>`, `motor a <power>`, `motor b <power>`
-
-### Main Loop (`main.rs`)
-
-1. Initializes peripherals (LEDC, UART, WiFi)
-2. Sets up servo on GPIO18 (LEDC Timer0, Channel0)
-3. Sets up Motor A on GPIO32/33 (LEDC Timer1, Channel1/2)
-4. Sets up Motor B on GPIO25/26 (LEDC Timer1, Channel3/4)
-5. Connects to WiFi network
-6. Spawns background tasks:
-   - WiFi connection manager
-   - Network stack runner
-   - HTTP server
-   - Serial command handler
-7. Main loop uses nested `select` combinators to wait for updates from HTTP or serial (6 signal sources), then controls servo/motors
-
-## Async Execution Model
-
-### Is the main loop executing every tick?
-
-**No.** The main loop is _not_ polling or running on a fixed tick. It **sleeps** until woken by an event.
-
-```rust
-loop {
-    match select(
-        select4(
-            SERVO_ANGLE.wait(),
-            SERIAL_SERVO_ANGLE.wait(),
-            MOTOR_A_POWER.wait(),
-            MOTOR_B_POWER.wait(),
-        ),
-        select(
-            SERIAL_MOTOR_A_POWER.wait(),
-            SERIAL_MOTOR_B_POWER.wait(),
-        ),
-    ).await {
-        Either::First(Either4::First(angle)) => servo.set_angle(angle),
-        Either::First(Either4::Second(angle)) => servo.set_angle(angle),
-        Either::First(Either4::Third(power)) => motor_a.set_power(power),
-        Either::First(Either4::Fourth(power)) => motor_b.set_power(power),
-        Either::Second(Either::First(power)) => motor_a.set_power(power),
-        Either::Second(Either::Second(power)) => motor_b.set_power(power),
-    }
-}
+```text
+Serial / HTTP / BLE
+        |
+        v
+   COMMANDS channel
+        |
+        v
+ main command loop
+        |
+        +--> TB6612 / H-bridge motors
+        +--> ST3215 bus driver on UART1
 ```
 
-When execution hits `.await`, the task **yields** and the CPU can sleep or run other tasks. The main task only wakes when:
-
-- The HTTP server signals a new servo angle via `SERVO_ANGLE.signal(angle)`
-- The serial handler signals servo via `SERIAL_SERVO_ANGLE.signal(angle)`
-- The HTTP server signals motor power via `MOTOR_A_POWER.signal(power)` or `MOTOR_B_POWER.signal(power)`
-- The serial handler signals motor power via `SERIAL_MOTOR_A_POWER.signal(power)` or `SERIAL_MOTOR_B_POWER.signal(power)`
-
-### How Nested `select()` Works
-
-We use nested `select` combinators to handle 6 signal sources (more than `select4` supports):
-
-1. All six signal `.wait()` futures are polled concurrently via nested selects
-2. When **any one** completes, the nested select returns immediately with that result
-3. The other futures are dropped (but their signals remain for next iteration)
-
-This is **not busy-polling**. If no signal is ready, the executor puts the task to sleep.
-
-### Embassy Executor Model
-
-Embassy uses a **single-threaded, cooperative, interrupt-driven** scheduler:
-
-| Concept              | Description                                           |
-| -------------------- | ----------------------------------------------------- |
-| **Cooperative**      | Tasks voluntarily yield at `.await` points            |
-| **Single-threaded**  | One task runs at a time (no preemption between tasks) |
-| **Interrupt-driven** | Hardware interrupts wake sleeping tasks               |
-| **No fixed tick**    | Wakeups happen on-demand, not periodically            |
-
-**Task lifecycle:**
-
-1. Task runs until it hits `.await` on a pending future
-2. Task yields to executor and goes to sleep
-3. Hardware interrupt fires (timer, UART RX, WiFi packet, etc.)
-4. Interrupt handler calls `Waker::wake()` to mark task as ready
-5. Executor polls the task again
-
-### Example Flow: HTTP Request → Servo Movement
-
-```
-1. WiFi packet arrives       → Hardware interrupt
-2. Interrupt wakes net_task  → Executor runs net_task
-3. net_task processes packet → Wakes http_server_task
-4. HTTP server parses URL    → Calls SERVO_ANGLE.signal(90)
-5. signal() wakes main task  → Executor runs main task
-6. select() returns angle    → servo.set_angle(90)
-7. Main task loops, awaits   → Goes back to sleep
-```
-
-The CPU spends most of its time **sleeping**. It wakes only for interrupts, does minimal work, then sleeps again. This is extremely power-efficient.
-
-### RTOS Timing
-
-There is no fixed "tick rate" like traditional RTOS (e.g., FreeRTOS 1ms tick). Instead:
-
-- **Timers**: `Timer::after(Duration::from_millis(500))` sets a hardware timer interrupt; the executor sleeps until it fires
-- **Signals**: Wake immediately when `signal()` is called from another task
-- **I/O**: UART/WiFi interrupts wake tasks when data arrives
-
-The ESP32's timer peripheral runs at **80 MHz APB clock**, providing microsecond-level precision for timing operations.
+Embassy tasks sleep at `.await` points and wake from UART, WiFi, BLE, timer, or channel events. There is no fixed polling tick in the main loop beyond the 50 ms watchdog check.
 
 ## Dependencies
 
 Key crates used:
 
-| Crate              | Purpose                              |
-| ------------------ | ------------------------------------ |
-| `esp-hal`          | Hardware abstraction layer for ESP32 |
-| `esp-radio`        | WiFi driver                          |
-| `esp-rtos`         | Embassy integration for ESP32        |
-| `embassy-net`      | Async TCP/IP networking              |
-| `embassy-executor` | Async task executor                  |
-| `embassy-sync`     | Async synchronization primitives     |
-| `embassy-time`     | Async timers and delays              |
+| Crate              | Purpose                            |
+| ------------------ | ---------------------------------- |
+| `esp-hal`          | ESP32 hardware abstraction layer   |
+| `esp-radio`        | WiFi/BLE radio support             |
+| `esp-rtos`         | Embassy integration for ESP32      |
+| `embassy-net`      | Async TCP/IP networking            |
+| `embassy-executor` | Async task executor                |
+| `embassy-sync`     | Channels, mutexes, and signals     |
+| `picoserve`        | Embedded HTTP server               |
+| `trouble-host`     | BLE host and GATT server           |
+| `esp-storage`      | Flash-backed configuration storage |

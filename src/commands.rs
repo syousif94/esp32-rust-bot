@@ -91,6 +91,12 @@ pub enum Command {
     },
     /// Enable/disable torque on a single servo
     St3215Torque { id: u8, enable: bool },
+    /// Persistently calibrate the current physical position as zero/home.
+    St3215Zero { id: u8 },
+    /// Drive a servo in 360-degree wheel mode with signed speed.
+    St3215Wheel { id: u8, speed: i16, acc: u8 },
+    /// Switch a servo back to normal position-control mode.
+    St3215ServoMode { id: u8 },
     /// Change a servo's ID (EEPROM write). Triggers an auto-rescan on success.
     St3215SetId { current: u8, new: u8 },
     /// Ping a single servo and log the result.

@@ -546,6 +546,36 @@ async fn command_loop<M: MotorControl>(
                         }
                     }
                 }
+                Command::St3215Zero { id } => {
+                    if let Some(bus) = SHARED_BUS.try_get() {
+                        let mut g = bus.lock().await;
+                        match g.calibrate_zero(id).await {
+                            Ok(()) => println!("ST3215[{}] zero calibrated", id),
+                            Err(e) => println!("ST3215[{}] zero error: {:?}", id, e),
+                        }
+                    }
+                }
+                Command::St3215Wheel { id, speed, acc } => {
+                    if let Some(bus) = SHARED_BUS.try_get() {
+                        let mut g = bus.lock().await;
+                        match g.write_wheel_speed(id, speed, acc).await {
+                            Ok(()) => println!(
+                                "ST3215[{}] wheel speed={} acc={}",
+                                id, speed, acc
+                            ),
+                            Err(e) => println!("ST3215[{}] wheel error: {:?}", id, e),
+                        }
+                    }
+                }
+                Command::St3215ServoMode { id } => {
+                    if let Some(bus) = SHARED_BUS.try_get() {
+                        let mut g = bus.lock().await;
+                        match g.set_servo_mode(id).await {
+                            Ok(()) => println!("ST3215[{}] servo mode", id),
+                            Err(e) => println!("ST3215[{}] servo mode error: {:?}", id, e),
+                        }
+                    }
+                }
                 Command::St3215SetId { current, new } => {
                     if let Some(bus) = SHARED_BUS.try_get() {
                         let mut g = bus.lock().await;
